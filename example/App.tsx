@@ -36,6 +36,7 @@ export default function App() {
   const [status, setStatus] = useState('')
   const [error, setError] = useState<string>()
   const [scrubbing, setScrubbing] = useState<number>()
+  const [logStatus, setLogStatus] = useState<string>()
 
   const playback = usePlaybackState()
   const progress = useProgress(250)
@@ -71,6 +72,28 @@ export default function App() {
       setPhase('idle')
     } finally {
       setStatus('')
+    }
+  }
+
+  const sendLogs = async () => {
+    setLogStatus('Sending logs…')
+    try {
+      const response = await fetch('http://localhost:8099/logs', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          time: new Date().toISOString(),
+          enableVideo,
+          playback,
+          progress,
+          trackId: track?.id,
+          error,
+        }),
+      })
+      const result = await response.json()
+      setLogStatus(result.file ? `Logs saved: ${result.file}` : `Log server error: ${result.error}`)
+    } catch (e) {
+      setLogStatus(`Log server unreachable (run npm run logs): ${e instanceof Error ? e.message : String(e)}`)
     }
   }
 
@@ -114,6 +137,11 @@ export default function App() {
             Video mode is fixed once the player is set up.
           </Text>
         )}
+
+        <Pressable style={styles.logButton} onPress={sendLogs}>
+          <Text style={styles.logText}>Send logs (last 5s)</Text>
+        </Pressable>
+        {!!logStatus && <Text style={styles.status}>{logStatus}</Text>}
 
         {!!status && <Text style={styles.status}>{status}</Text>}
         {!!error && <Text style={styles.error}>{error}</Text>}
@@ -199,6 +227,15 @@ const styles = StyleSheet.create({
   },
   startText: { color: '#0b0b0f', fontSize: 17, fontWeight: '700' },
   disabled: { opacity: 0.5 },
+  logButton: {
+    borderWidth: 1,
+    borderColor: '#3a3a44',
+    borderRadius: 12,
+    height: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  logText: { color: '#f5f5f7', fontSize: 14, fontWeight: '600' },
   row: {
     flexDirection: 'row',
     alignItems: 'center',

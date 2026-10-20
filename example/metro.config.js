@@ -17,10 +17,10 @@ module.exports = {
     ...config.resolver,
     blockList: [
       config.resolver.blockList,
-      /(\/lib-origin\/roze\/native\/.+?\/.+?\.node\.ts)$/,
-      /\/nodejs-assets\/.*/,
-      new RegExp(`^${escape(path.join(libraryRoot, 'node_modules'))}\\/(${singletons.join('|')})\\/.*`),
-      new RegExp(`^${escape(path.join(libraryRoot, 'lib'))}\\/.*`),
+      /([\\/]lib-origin[\\/]roze[\\/]native[\\/].+?[\\/].+?\.node\.ts)$/,
+      /[\\/]nodejs-assets[\\/].*/,
+      new RegExp(`^${escape(path.join(libraryRoot, 'node_modules'))}[\\\\/](${singletons.join('|')})[\\\\/].*`),
+      new RegExp(`^${escape(path.join(libraryRoot, 'lib'))}[\\\\/].*`),
     ].flat().filter(Boolean),
     nodeModulesPaths: [path.join(projectRoot, 'node_modules')],
     extraNodeModules: {

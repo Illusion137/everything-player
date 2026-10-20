@@ -4,7 +4,7 @@ A full-featured React Native media player built on [Nitro Modules](https://githu
 
 - **Audio-first**: audio-only by default; video can be enabled with a flag (see [Video](#video)).
 - **Sources**: direct URLs, HLS, and YouTube SABR, auto-detected per track.
-- **Native engines**: iOS (Swift, SABR via `swift-googlevideo`) and Android (Kotlin/ExoPlayer, SABR stubbed until `kotlin-googlevideo` is ready).
+- **Native engines**: iOS (Swift, SABR via `swift-googlevideo`) and Android (Kotlin/ExoPlayer, SABR via a Kotlin port of `googlevideo`).
 - **Electron**: the same TypeScript API backed by a renderer engine (MediaSource + Web Audio, SABR via vendored `googlevideo`, HLS via shaka-player). See [Electron](#electron).
 
 ---

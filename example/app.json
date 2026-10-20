@@ -7,7 +7,8 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
     "platforms": [
-      "ios"
+      "ios",
+      "android"
     ],
     "ios": {
       "bundleIdentifier": "com.illusion.everythingplayer.sabrexample",
@@ -17,6 +18,9 @@
           "audio"
         ]
       }
+    },
+    "android": {
+      "package": "com.illusion.everythingplayer.sabrexample"
     }
   }
 }

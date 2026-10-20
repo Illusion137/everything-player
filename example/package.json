@@ -6,8 +6,11 @@
   "scripts": {
     "start": "expo start",
     "ios": "expo run:ios",
+    "android": "expo run:android",
     "prebuild": "expo prebuild --platform ios",
+    "prebuild:android": "expo prebuild --platform android",
     "pull-origin": "origin",
+    "logs": "node scripts/log-server.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
