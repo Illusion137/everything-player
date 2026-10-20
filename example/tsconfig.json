@@ -1,0 +1,47 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "skipLibCheck": true,
+    "ignoreDeprecations": "6.0",
+    "baseUrl": "./",
+    "allowImportingTsExtensions": true,
+    "paths": {
+      "@native/*": [
+        "lib-origin/roze/native/*"
+      ],
+      "@lib/*": [
+        "lib-origin/roze/lib/*"
+      ],
+      "@roze/*": [
+        "lib-origin/roze/src/*"
+      ],
+      "@origin/*": [
+        "lib-origin/origin/src/*"
+      ],
+      "@illusive/*": [
+        "lib-origin/Illusive/src/*"
+      ],
+      "@common/*": [
+        "lib-origin/common/*"
+      ],
+      "react-native-everything-player": [
+        "../src/index.ts"
+      ]
+    },
+    "noImplicitAny": false,
+    "types": [
+      "node"
+    ]
+  },
+  "include": [
+    "index.ts",
+    "App.tsx",
+    "src/**/*.ts",
+    "src/**/*.tsx"
+  ],
+  "exclude": [
+    "node_modules",
+    "lib-origin"
+  ]
+}

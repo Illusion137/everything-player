@@ -1,0 +1,46 @@
+{
+  "name": "everything-player-sabr-example",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "private": true,
+  "scripts": {
+    "start": "expo start",
+    "ios": "expo run:ios",
+    "prebuild": "expo prebuild --platform ios",
+    "pull-origin": "origin",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@react-native-community/slider": "5.2.0",
+    "babel-preset-expo": "~57.0.0",
+    "base-64": "^1.0.0",
+    "bgutils-js": "^4.0.3",
+    "buffer": "^6.0.3",
+    "crypto-js": "^4.2.0",
+    "event-target-polyfill": "^0.0.4",
+    "expo": "~57.0.30",
+    "expo-file-system": "~57.0.7",
+    "expo-network": "~57.0.2",
+    "expo-status-bar": "~57.0.1",
+    "googlevideo": "https://github.com/LuanRT/googlevideo",
+    "nodejs-mobile-react-native": "^18.20.4",
+    "path-browserify": "^1.0.1",
+    "react": "19.2.3",
+    "react-native": "0.86.3",
+    "react-native-everything-player": "file:..",
+    "react-native-nitro-modules": "0.37.1",
+    "react-native-quick-base64": "^2.1.2",
+    "react-native-url-polyfill": "^3.0.0",
+    "react-native-uuid": "^2.0.2",
+    "text-encoding-polyfill": "^0.6.7",
+    "web-streams-polyfill": "^4.2.0",
+    "youtubei.js": "https://github.com/Illusion137/YouTube.js#SUPER"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/react": "~19.2.2",
+    "babel-plugin-module-resolver": "^5.0.2",
+    "typescript": "~6.0.3",
+    "undici": "^8.12.2"
+  }
+}
