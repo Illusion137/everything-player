@@ -30,6 +30,8 @@ data class EPDownloadRecord(
   val totalBytes: Long?,
   val errorCode: String?,
   val errorMessage: String?,
+  val audioPath: String? = null,
+  val videoPath: String? = null,
 )
 
 @OptIn(UnstableApi::class)
@@ -95,16 +97,12 @@ object EPDownloads : DownloadManager.Listener {
   }
 
   fun isCompleted(context: Context, trackId: String): Boolean =
-    manager(context).downloadIndex.getDownload(trackId)?.state == Download.STATE_COMPLETED
+    EPSabrDownloads.isCompleted(context, trackId) ||
+      manager(context).downloadIndex.getDownload(trackId)?.state == Download.STATE_COMPLETED
 
   fun download(context: Context, track: EPTrack, includeVideo: Boolean, range: EPVideoQualityRange): EPDownloadRecord {
+    if (track.sabr != null) return EPSabrDownloads.download(context, track, includeVideo, range)
     val m = manager(context)
-    if (track.sabr != null) {
-      val record = EPDownloadRecord(track.id, track, "failed", 0.0, 0, null, EPErrorCode.SABR_UNSUPPORTED.code, "SABR downloads are not supported on Android yet")
-      failures[track.id] = record
-      main.post { onChanged?.invoke(record) }
-      return record
-    }
     val url = track.url ?: throw EPError(EPErrorCode.SOURCE_ERROR, "Track ${track.id} has no URL")
     m.downloadIndex.getDownload(track.id)?.let {
       if (it.state == Download.STATE_COMPLETED || it.state == Download.STATE_DOWNLOADING || it.state == Download.STATE_QUEUED) {
@@ -165,10 +163,12 @@ object EPDownloads : DownloadManager.Listener {
   }
 
   fun pause(context: Context, trackId: String) {
+    if (EPSabrDownloads.has(context, trackId)) return EPSabrDownloads.pause(context, trackId)
     main.post { manager(context).setStopReason(trackId, STOP_REASON_PAUSED) }
   }
 
   fun resume(context: Context, trackId: String) {
+    if (EPSabrDownloads.has(context, trackId)) return EPSabrDownloads.resume(context, trackId)
     main.post {
       manager(context).setStopReason(trackId, Download.STOP_REASON_NONE)
       main.removeCallbacks(poll)
@@ -177,6 +177,7 @@ object EPDownloads : DownloadManager.Listener {
   }
 
   fun cancel(context: Context, trackId: String) {
+    if (EPSabrDownloads.has(context, trackId)) return EPSabrDownloads.cancel(context, trackId)
     val existing = get(context, trackId) ?: return
     if (existing.state == "completed") return
     cancelled.add(trackId)
@@ -185,22 +186,25 @@ object EPDownloads : DownloadManager.Listener {
   }
 
   fun remove(context: Context, trackId: String) {
+    if (EPSabrDownloads.has(context, trackId)) return EPSabrDownloads.remove(context, trackId)
     failures.remove(trackId)
     main.post { manager(context).removeDownload(trackId) }
   }
 
   fun removeAll(context: Context) {
+    EPSabrDownloads.removeAll(context)
     failures.clear()
     main.post { manager(context).removeAllDownloads() }
   }
 
   fun get(context: Context, trackId: String): EPDownloadRecord? {
+    EPSabrDownloads.get(context, trackId)?.let { return it }
     failures[trackId]?.let { return it }
     return manager(context).downloadIndex.getDownload(trackId)?.let { record(it) }
   }
 
   fun all(context: Context): List<EPDownloadRecord> {
-    val result = failures.values.toMutableList()
+    val result = (EPSabrDownloads.all(context) + failures.values).toMutableList()
     manager(context).downloadIndex.getDownloads().use { cursor ->
       while (cursor.moveToNext()) result.add(record(cursor.download))
     }

@@ -30,8 +30,11 @@ object EPPlayerEngine : EPPipelineDelegate {
   var onVideoQualityChanged: ((EPVideoQualityState, String?) -> Unit)? = null
   var sabrCallbacks: EPSabrCallbackProvider? = null
   var downloadedResolver: ((EPTrack) -> Boolean)? = null
+  var localSabrResolver: ((EPTrack) -> EPLocalSabrMedia?)? = null
 
   private val main = Handler(Looper.getMainLooper())
+  private val sabrPool = EPSabrWarmPool()
+  private var sabrTicks = 0
   private val lock = Any()
   private lateinit var appContext: Context
 
@@ -387,6 +390,7 @@ object EPPlayerEngine : EPPipelineDelegate {
     }
     onMain {
       releasePipelines()
+      sabrPool.clear()
       setState(EPState.STOPPED)
       audioFocus?.abandon()
     }
@@ -402,6 +406,7 @@ object EPPlayerEngine : EPPipelineDelegate {
     }
     onMain {
       releasePipelines()
+      sabrPool.clear()
       setState(EPState.NONE)
       audioFocus?.abandon()
     }
@@ -436,7 +441,8 @@ object EPPlayerEngine : EPPipelineDelegate {
   private fun makePipeline(track: EPTrack): EPPipeline {
     val sabr = track.sabr
     val pipeline: EPPipeline = if (sabr != null) {
-      EPSabrPipeline(track, sabr, setupOptions, sabrCallbacks)
+      val local = localSabrResolver?.invoke(track)
+      EPSabrPipeline(appContext, track, sabr, setupOptions, sabrCallbacks, local, if (local == null) sabrPool else null, qualityRange)
     } else {
       EPExoPipeline(appContext, track, setupOptions, downloadedResolver?.invoke(track) == true, qualityRange)
     }
@@ -655,6 +661,8 @@ object EPPlayerEngine : EPPipelineDelegate {
 
   private fun onTick() {
     snapshot = computeProgress()
+    sabrTicks += 1
+    if (sabrTicks % 300 == 0) warmUpcomingSabr()
     val p = primary ?: return
     if (!::appContext.isInitialized) return
     if (!isPlayWhenReady()) return
@@ -689,7 +697,29 @@ object EPPlayerEngine : EPPipelineDelegate {
     if (remaining <= 0.05) finishFade()
   }
 
+  private fun warmUpcomingSabr() {
+    val (tracks, options) = locked {
+      val a = activeIndex
+      if (a == null || a >= queue.size) return@locked emptyList<EPTrack>() to setupOptions
+      val out = mutableListOf<EPTrack>()
+      var i: Int = a
+      var remaining = maxOf(0, minOf(setupOptions.sabrPoolAhead, queue.size - 1))
+      while (remaining-- > 0) {
+        i += 1
+        if (i >= queue.size) {
+          if (repeatMode != EPRepeatMode.QUEUE) break
+          i = 0
+        }
+        out.add(queue[i])
+      }
+      out to setupOptions
+    }
+    val candidates = tracks.filter { it.sabr != null && localSabrResolver?.invoke(it) == null }
+    sabrPool.warm(candidates, options, sabrCallbacks)
+  }
+
   private fun preloadUpcoming() {
+    warmUpcomingSabr()
     val upcoming = locked {
       val a = activeIndex ?: return@locked emptyList()
       queue.drop(a + 1).take(maxOf(0, setupOptions.preloadNext))

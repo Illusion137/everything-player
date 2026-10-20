@@ -2,6 +2,7 @@ package com.margelo.nitro.everythingplayer.engine
 
 import android.content.Context
 import android.graphics.SurfaceTexture
+import android.graphics.drawable.Drawable
 import android.opengl.EGL14
 import android.opengl.EGLConfig
 import android.opengl.EGLContext
@@ -147,8 +148,19 @@ object EPVideoHub {
     }
   }
 
+  private var dbgFrames = 0
+  private var dbgDraws = 0
+  private var dbgDrawNs = 0L
+  private var dbgSince = System.nanoTime()
+
   private fun onFrame() {
     val st = surfaceTexture ?: return
+    dbgFrames++
+    val now = System.nanoTime()
+    if (now - dbgSince > 1_000_000_000L) {
+      android.util.Log.d("EPDBG", "video frames=$dbgFrames draws=$dbgDraws avgDrawMs=${if (dbgDraws > 0) dbgDrawNs / dbgDraws / 1_000_000.0 else 0.0} outputs=${outputs.size} shown=${outputs.count { it.view.isShown }}")
+      dbgFrames = 0; dbgDraws = 0; dbgDrawNs = 0; dbgSince = now
+    }
     EGL14.eglMakeCurrent(display, pbuffer, pbuffer, context)
     st.updateTexImage()
     st.getTransformMatrix(transform)
@@ -170,6 +182,11 @@ object EPVideoHub {
   }
 
   private fun draw(out: Output) {
+    val t0 = System.nanoTime()
+    try { drawImpl(out) } finally { dbgDraws++; dbgDrawNs += System.nanoTime() - t0 }
+  }
+
+  private fun drawImpl(out: Output) {
     if (!EGL14.eglMakeCurrent(display, out.eglSurface, out.eglSurface, context)) return
     GLES20.glViewport(0, 0, out.width, out.height)
     GLES20.glClearColor(0f, 0f, 0f, 1f)
@@ -257,6 +274,9 @@ class EPVideoSurfaceView(context: Context) : TextureView(context), TextureView.S
     surfaceTextureListener = this
     isOpaque = true
   }
+
+  @Deprecated("TextureView cannot display a background drawable")
+  override fun setBackgroundDrawable(background: Drawable?) {}
 
   override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
     EPVideoHub.addOutput(this, surface, width, height)

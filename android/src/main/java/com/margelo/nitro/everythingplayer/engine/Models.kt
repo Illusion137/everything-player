@@ -18,7 +18,15 @@ enum class EPErrorCode(val code: String) {
   UNKNOWN("unknown"),
 }
 
-class EPError(val errorCode: EPErrorCode, override val message: String, var trackId: String? = null) : Exception(message)
+class EPError(val errorCode: EPErrorCode, override val message: String, var trackId: String? = null) : Exception(message) {
+  companion object {
+    fun from(error: Throwable, default: EPErrorCode = EPErrorCode.UNKNOWN): EPError = when (error) {
+      is EPError -> error
+      is java.io.IOException -> EPError(EPErrorCode.NETWORK_ERROR, error.message ?: error.toString())
+      else -> EPError(default, error.message ?: error.toString())
+    }
+  }
+}
 
 data class EPSabrFormat(
   val itag: Int,
@@ -111,7 +119,30 @@ data class EPVideoQualityRange(
   val minHeight: Int? = null,
   val maxHeight: Int? = 720,
   val maxBitrate: Int? = null,
-)
+) {
+  fun contains(height: Int?, bitrate: Int): Boolean {
+    val h = height ?: 0
+    if (minHeight != null && h < minHeight) return false
+    if (maxHeight != null && h > maxHeight) return false
+    if (maxBitrate != null && maxBitrate > 0 && bitrate > maxBitrate) return false
+    return true
+  }
+
+  fun <T> pick(items: List<T>, height: (T) -> Int?, bitrate: (T) -> Int, budget: Int? = null): T? {
+    if (items.isEmpty()) return null
+    val sorted = items.sortedWith(compareBy<T>({ height(it) ?: 0 }, { bitrate(it) }))
+    val inRange = sorted.filter { contains(height(it), bitrate(it)) }
+    if (budget != null) {
+      val pool = inRange.ifEmpty { sorted }
+      return pool.lastOrNull { bitrate(it) <= budget } ?: pool.first()
+    }
+    inRange.lastOrNull()?.let { return it }
+    if (maxHeight != null && sorted.all { (height(it) ?: 0) > maxHeight }) return sorted.first()
+    if (maxBitrate != null && maxBitrate > 0) sorted.lastOrNull { bitrate(it) <= maxBitrate }?.let { return it }
+    if (minHeight != null && sorted.all { (height(it) ?: 0) < minHeight }) return sorted.last()
+    return sorted.first()
+  }
+}
 
 data class EPVideoQuality(
   val id: String,

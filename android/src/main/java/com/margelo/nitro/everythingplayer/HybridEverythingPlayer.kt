@@ -14,6 +14,7 @@ import com.margelo.nitro.everythingplayer.engine.EPError
 import com.margelo.nitro.everythingplayer.engine.EPErrorCode
 import com.margelo.nitro.everythingplayer.engine.EPPlayerEngine
 import com.margelo.nitro.everythingplayer.engine.EPRepeatMode
+import com.margelo.nitro.everythingplayer.engine.EPSabrDownloads
 import com.margelo.nitro.everythingplayer.engine.EPSetupOptions
 import com.margelo.nitro.everythingplayer.engine.EPSourceType
 import com.margelo.nitro.everythingplayer.engine.EPState
@@ -34,6 +35,7 @@ class HybridEverythingPlayer : HybridEverythingPlayerSpec() {
   override fun setupPlayer(options: NativeSetupOptions): Promise<Unit> {
     val ctx = context
     engine.downloadedResolver = { track -> EPDownloads.isCompleted(ctx, track.id) }
+    engine.localSabrResolver = { track -> EPSabrDownloads.localMedia(ctx, track) }
     engine.setup(
       ctx,
       EPSetupOptions(

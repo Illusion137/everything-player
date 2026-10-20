@@ -22,16 +22,6 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
-import com.margelo.nitro.everythingplayer.googlevideo.ClientInfo
-import com.margelo.nitro.everythingplayer.googlevideo.EnabledTrackTypes
-import com.margelo.nitro.everythingplayer.googlevideo.ReloadPlaybackContext
-import com.margelo.nitro.everythingplayer.googlevideo.ReloadResponse
-import com.margelo.nitro.everythingplayer.googlevideo.SabrFormat
-import com.margelo.nitro.everythingplayer.googlevideo.SabrPlaybackOptions
-import com.margelo.nitro.everythingplayer.googlevideo.SabrStream
-import com.margelo.nitro.everythingplayer.googlevideo.SabrStreamCallbacks
-import com.margelo.nitro.everythingplayer.googlevideo.SabrStreamConfig
-import com.margelo.nitro.everythingplayer.googlevideo.SabrUnsupportedException
 
 sealed class EPPipelineStatus {
   object Idle : EPPipelineStatus()
@@ -78,26 +68,28 @@ interface EPPipeline {
 }
 
 @OptIn(UnstableApi::class)
-class EPExoPipeline(
+open class EPExoPipeline(
   private val context: Context,
   override val track: EPTrack,
-  private val options: EPSetupOptions,
+  protected val options: EPSetupOptions,
   private val downloaded: Boolean,
   initialRange: EPVideoQualityRange,
 ) : EPPipeline, Player.Listener {
   override var delegate: EPPipelineDelegate? = null
-  override var status: EPPipelineStatus = EPPipelineStatus.Idle
+  final override var status: EPPipelineStatus = EPPipelineStatus.Idle
     private set
 
-  private val player: ExoPlayer
+  protected val player: ExoPlayer
   private var equalizer: EPEqualizerController? = null
   private var frozenPosition: Double? = null
   private var seeking = false
-  private var playWhenReady = false
-  private var released = false
+  protected var playWhenReady = false
+    private set
+  protected var released = false
+    private set
   private var videoAttached = false
   private var manualQualityId: String? = null
-  private val handler: Handler
+  protected val handler: Handler
 
   @Volatile
   private var qualityState = EPVideoQualityState()
@@ -122,6 +114,7 @@ class EPExoPipeline(
     }.build()
     handler = Handler(player.applicationLooper)
     player.addListener(this)
+    player.addAnalyticsListener(androidx.media3.exoplayer.util.EventLogger("EPDBG-${track.id}"))
   }
 
   override val videoQuality: EPVideoQualityState get() = qualityState
@@ -145,7 +138,7 @@ class EPExoPipeline(
     }
   }
 
-  private fun refreshQuality() {
+  protected open fun refreshQuality() {
     if (!options.enableVideo) return
     val playing = player.videoFormat
     val list = mutableListOf<EPVideoQuality>()
@@ -201,7 +194,7 @@ class EPExoPipeline(
     get() = player.playbackParameters.speed
     set(value) { player.playbackParameters = PlaybackParameters(value) }
 
-  private fun mediaSource(): MediaSource {
+  protected open fun mediaSource(position: Double): MediaSource {
     val uri = Uri.parse(track.url ?: throw EPError(EPErrorCode.SOURCE_ERROR, "Track ${track.id} has no URL"))
     val metadata = MediaMetadata.Builder()
       .setTitle(track.title)
@@ -228,13 +221,13 @@ class EPExoPipeline(
   }
 
   override fun load(position: Double) {
+    val start = maxOf(position, track.trimStart)
     val source = try {
-      mediaSource()
+      mediaSource(start)
     } catch (e: EPError) {
       fail(e)
       return
     }
-    val start = maxOf(position, track.trimStart)
     frozenPosition = if (start > 0) start else null
     seeking = start > 0
     setStatus(EPPipelineStatus.Loading)
@@ -329,127 +322,28 @@ class EPExoPipeline(
   }
 
   override fun onPlayerError(error: PlaybackException) {
+    mapError(error)?.let { fail(it) }
+  }
+
+  protected open fun mapError(error: PlaybackException): EPError? {
     val code = when (error.errorCode) {
       in PlaybackException.ERROR_CODE_IO_UNSPECIFIED..PlaybackException.ERROR_CODE_IO_CLEARTEXT_NOT_PERMITTED -> EPErrorCode.NETWORK_ERROR
       in PlaybackException.ERROR_CODE_DECODER_INIT_FAILED..PlaybackException.ERROR_CODE_DECODING_RESOURCES_RECLAIMED -> EPErrorCode.DECODE_ERROR
       else -> EPErrorCode.SOURCE_ERROR
     }
-    fail(EPError(code, error.message ?: error.errorCodeName))
+    return EPError(code, error.message ?: error.errorCodeName)
   }
 
-  private fun setStatus(new: EPPipelineStatus) {
+  protected fun setStatus(new: EPPipelineStatus) {
     if (released || status == new || status is EPPipelineStatus.Failed) return
     status = new
     delegate?.onPipelineStatus(this, new)
   }
 
-  private fun fail(error: EPError) {
+  protected fun fail(error: EPError) {
     if (released || status is EPPipelineStatus.Failed) return
     error.trackId = track.id
     player.playWhenReady = false
-    status = EPPipelineStatus.Failed(error.message)
-    delegate?.onPipelineError(this, error)
-  }
-}
-
-class EPSabrPipeline(
-  override val track: EPTrack,
-  private val sabr: EPSabrInfo,
-  private val options: EPSetupOptions,
-  private val callbacks: EPSabrCallbackProvider?,
-) : EPPipeline {
-  override var delegate: EPPipelineDelegate? = null
-  override var status: EPPipelineStatus = EPPipelineStatus.Idle
-    private set
-  override val currentTime: Double get() = position
-  override val mediaDuration: Double? get() = sabr.duration.takeIf { it > 0 } ?: track.duration
-  override val bufferedTime: Double get() = position
-  override var volume: Float = 1f
-  override var rate: Float = 1f
-  override val exoPlayer: ExoPlayer? = null
-  override val videoQuality: EPVideoQualityState = EPVideoQualityState()
-
-  override fun setVideoQuality(id: String?, range: EPVideoQualityRange) {
-    if (id != null) throw EPError(EPErrorCode.SABR_UNSUPPORTED, "SABR is not supported on Android yet")
-  }
-
-  private var position = 0.0
-  private var stream: SabrStream? = null
-  private var released = false
-
-  override fun load(position: Double) {
-    this.position = maxOf(position, track.trimStart)
-    start()
-  }
-
-  private fun start() {
-    stream?.abort()
-    val trackId = track.id
-    val provider = callbacks
-    suspend fun mintFn(): ByteArray = provider!!.mintPoToken(trackId)
-    suspend fun reloadFn(ctx: ReloadPlaybackContext?): ReloadResponse {
-      val r = provider!!.reloadPlayerResponse(trackId, ctx?.token)
-      return ReloadResponse(r.first, r.second)
-    }
-    val mint: (suspend () -> ByteArray)? = if (provider == null) null else ::mintFn
-    val reload: (suspend (ReloadPlaybackContext?) -> ReloadResponse)? = if (provider == null) null else ::reloadFn
-    val config = SabrStreamConfig(
-      videoId = sabr.videoId,
-      serverAbrStreamingUrl = sabr.serverAbrStreamingUrl,
-      videoPlaybackUstreamerConfig = sabr.videoPlaybackUstreamerConfig,
-      poToken = sabr.poToken,
-      clientInfo = ClientInfo(sabr.clientName, sabr.clientVersion),
-      formats = sabr.formats.map {
-        SabrFormat(it.itag, it.lastModified, it.xtags, it.mimeType, it.bitrate, it.approxDurationMs, it.contentLength, it.width, it.height, it.fps, it.audioTrackId, it.isDrc, it.isVb, it.language)
-      },
-      headers = track.requestHeaders,
-      callbacks = SabrStreamCallbacks(onMintPoToken = mint, onReloadPlayerResponse = reload),
-      videoHighWaterMark = options.maxBufferBytes,
-      audioHighWaterMark = minOf(3 shl 20, options.maxBufferBytes / 4),
-    )
-    val s = SabrStream(config)
-    stream = s
-    val audio = sabr.formats.filter { it.mimeType?.startsWith("audio") == true }.maxByOrNull { it.bitrate }
-    if (audio == null) {
-      fail(EPError(EPErrorCode.SABR_STREAM_FAILED, "No audio format in SABR formats"))
-      return
-    }
-    setStatus(EPPipelineStatus.Loading)
-    try {
-      s.start(SabrPlaybackOptions(audioItag = audio.itag, enabledTrackTypes = EnabledTrackTypes.AUDIO_ONLY, startTimeMs = (position * 1000).toLong()))
-    } catch (e: SabrUnsupportedException) {
-      fail(EPError(EPErrorCode.SABR_UNSUPPORTED, e.message ?: "SABR is not supported on Android yet"))
-    } catch (e: Exception) {
-      fail(EPError(EPErrorCode.SABR_STREAM_FAILED, e.message ?: e.toString()))
-    }
-  }
-
-  override fun play() {}
-  override fun pause() {}
-
-  override fun seek(seconds: Double) {
-    position = maxOf(track.trimStart, seconds)
-    if (status !is EPPipelineStatus.Failed) start()
-  }
-
-  override fun attachVideo() {}
-  override fun detachVideo() {}
-
-  override fun teardown() {
-    released = true
-    stream?.abort()
-    stream = null
-  }
-
-  private fun setStatus(new: EPPipelineStatus) {
-    if (released || status == new || status is EPPipelineStatus.Failed) return
-    status = new
-    delegate?.onPipelineStatus(this, new)
-  }
-
-  private fun fail(error: EPError) {
-    if (released || status is EPPipelineStatus.Failed) return
-    error.trackId = track.id
     status = EPPipelineStatus.Failed(error.message)
     delegate?.onPipelineError(this, error)
   }
