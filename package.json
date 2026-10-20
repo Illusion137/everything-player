@@ -42,7 +42,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "specs": "nitrogen --logLevel=\"debug\"",
-    "build": "bob build"
+    "build": "bob build",
+    "prepare": "bob build"
   },
   "keywords": [
     "react-native",
