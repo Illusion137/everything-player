@@ -1,0 +1,1176 @@
+import { UmpReader } from './UmpReader.js';
+
+import type { FetchFunction, SabrFormat } from '../types/shared.js';
+
+import type {
+  AbortOptions,
+  HeartbeatParams,
+  HeartbeatRequest,
+  SabrPlaybackOptions,
+  SabrSnapshot,
+  SabrStreamCallbacks,
+  SabrStreamConfig,
+  SabrStreamEvents,
+  SelectedFormats,
+  StreamStartResult,
+  TrackOutput
+} from '../types/sabrStreamTypes.js';
+
+import { Logger } from '../utils/Logger.js';
+import { SabrSegmentBuffer } from '../utils/SabrSegmentBuffer.js';
+import { EventEmitterLike } from '../utils/EventEmitterLike.js';
+import { chooseFormat, createFormatKey, describeMissingFormat, EnabledTrackTypes } from '../utils/formatUtils.js';
+import { assert, assertIsDefined, getMediaType, wait } from '../utils/misc.js';
+
+import {
+  AdState,
+  CuepointEvent,
+  CuepointList,
+  FormatInitializationMetadata,
+  MediaHeader,
+  NextRequestPolicy,
+  PlaybackCookie,
+  ReloadPlaybackContext,
+  SabrContextSendingPolicy,
+  SabrContextUpdate,
+  SabrContextWritePolicy,
+  SabrError,
+  SabrLiveMetadata,
+  SabrRedirect,
+  SabrSeek,
+  SeekSource,
+  StreamProtectionStatus,
+  UMPPartId,
+  VideoPlaybackAbrRequest,
+  type ClientInfo,
+  type ClientAbrState,
+  type SsapPlaybackInfo
+} from '../utils/Protos.js';
+
+import { ticksToMs } from '../utils/mediaTimeUtils.js';
+import { base64ToU8, decodePart } from '../utils/uint8arrayUtils.js';
+import { getBroadcastId, getNextFallbackUrl } from '../utils/urlUtils.js';
+import { buildMediaCapabilities } from '../utils/mediaCapabilityUtils.js';
+import { TrackCollection } from '../utils/TrackCollection.js';
+
+const TAG = 'SabrStream';
+
+const MAX_STALLS = 3;
+const DEFAULT_MAX_RETRIES = 10;
+const DEFAULT_STALL_DETECTION_MS = 30_000;
+const REQUEST_TIMEOUT_MS = 30_000;
+const INITIAL_RETRY_BACKOFF_MS = 500;
+const MAX_RETRY_BACKOFF_MS = 5_000;
+const OFFLINE_GRACE_PERIOD_MS = 15_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
+const LIVE_EDGE_SENTINEL_MS = Number.MAX_SAFE_INTEGER;
+
+const DEFAULT_VIDEO_HWM = 1024 * 1024 * 16;
+const DEFAULT_AUDIO_HWM = 1024 * 1024 * 3;
+
+const BANDWIDTH_EMA_PREVIOUS_WEIGHT = 0.8;
+const BANDWIDTH_EMA_CURRENT_WEIGHT = 0.2;
+const MIN_FETCH_DURATION_FOR_BW_ESTIMATE_MS = 50;
+
+export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
+  private readonly logger = Logger.getInstance();
+  private readonly formats: SabrFormat[] = [];
+  private readonly segmentBuffer: SabrSegmentBuffer;
+
+  private fetchFunction: FetchFunction;
+  private abortController?: AbortController;
+  private requestTimeoutId?: ReturnType<typeof setTimeout>;
+
+  private serverAbrStreamingUrl?: URL;
+  private videoPlaybackUstreamerConfig: string;
+  private clientInfo: ClientInfo;
+  private proofOfOriginToken?: Uint8Array;
+  private heartbeatParams: HeartbeatParams;
+
+  private nextRequestPolicy?: NextRequestPolicy;
+  private ssapPlaybackInfos = new Map<string, SsapPlaybackInfo>();
+  private sabrContextUpdates = new Map<number, SabrContextUpdate>();
+  private activeSabrContextTypes = new Set<number>();
+  private trackCollection = new TrackCollection();
+
+  private videoId?: string;
+  private broadcastId?: string;
+
+  private idleResolvers: (() => void)[] = [];
+  private drainResolver?: () => void;
+
+  private shouldStop = false;
+  private isMintingPoToken = false;
+  private isBroadcast = false;
+
+  private runtime = {
+    playerTimeMs: 0,
+    requestNumber: 0,
+    bandwidthEstimateBps: 0,
+    lastHeartbeatTimeMs: 0,
+    playbackSessionStartMs: undefined as number | undefined,
+    poTokenGenerationId: 0,
+    spsRejectCount: 0
+  };
+
+  private lifecycle = {
+    aborted: false,
+    errored: false,
+    busy: false
+  };
+
+  private progressTracker = {
+    lastProgressTime: Date.now(),
+    lastBufferedTimeMs: 0,
+    stallCount: 0
+  };
+
+  private callbacks: SabrStreamCallbacks;
+
+  private seekEpoch = 0;
+  private lastSeekWallMs?: number;
+  private resumeResolver?: () => void;
+  private warming = false;
+  private selectedFormats?: SelectedFormats;
+  private nextRequestPolicyReceivedMs = 0;
+  private readonly videoHighWaterMark: number;
+  private readonly audioHighWaterMark: number;
+
+  constructor(config: SabrStreamConfig) {
+    super();
+    this.fetchFunction = config.fetchFunction || fetch;
+
+    this.videoId = config.videoId;
+    this.formats = config.formats || [];
+    this.clientInfo = config.clientInfo;
+    this.videoPlaybackUstreamerConfig = config.videoPlaybackUstreamerConfig;
+    this.proofOfOriginToken = config.poToken ? base64ToU8(config.poToken) : undefined;
+    this.heartbeatParams = config.heartbeatParams || {};
+    this.callbacks = config.callbacks || {};
+
+    this.setStreamingURL(config.serverAbrStreamingUrl);
+
+    this.isBroadcast = [ 'yt_premiere_broadcast', 'yt_live_broadcast' ].includes(this.streamingURL.searchParams.get('source') || '');
+
+    this.broadcastId = this.isBroadcast ? getBroadcastId(this.streamingURL) : undefined;
+
+    this.videoHighWaterMark = config.videoHighWaterMark ?? DEFAULT_VIDEO_HWM;
+    this.audioHighWaterMark = config.audioHighWaterMark ?? DEFAULT_AUDIO_HWM;
+    this.trackCollection.video.output = this.createTrackStream(this.videoHighWaterMark);
+    this.trackCollection.audio.output = this.createTrackStream(this.audioHighWaterMark);
+
+    this.segmentBuffer = new SabrSegmentBuffer(this.trackCollection, this.isBroadcast, config.stripDuplicateInit, (segment) => this.emit('segment', segment));
+  }
+
+  //#region Public API
+  public get isLive(): boolean {
+    return this.isBroadcast;
+  }
+
+  public get isBusy(): boolean {
+    return this.lifecycle.busy;
+  }
+
+  public get isAborted(): boolean {
+    return this.lifecycle.aborted;
+  }
+
+  public get isErrored(): boolean {
+    return this.lifecycle.errored;
+  }
+
+  public get videoEndTimeMs(): number {
+    return this.trackCollection.video.endTimeMs;
+  }
+
+  public get audioEndTimeMs(): number {
+    return this.trackCollection.audio.endTimeMs;
+  }
+
+  public get livePlaybackLatencyMs(): number | undefined {
+    if (!this.isBroadcast) return;
+    return this.trackCollection.livePlaybackLatencyMs;
+  }
+
+  public get streamingURL(): URL {
+    assertIsDefined(this.serverAbrStreamingUrl, 'Streaming URL is not set');
+    return this.serverAbrStreamingUrl;
+  }
+
+  public setStreamingURL(url: string | URL): void {
+    this.serverAbrStreamingUrl = url instanceof URL ? url : new URL(url);
+    this.serverAbrStreamingUrl.searchParams.set('alr', 'no');
+    this.validateStreamingUrl(this.serverAbrStreamingUrl);
+  }
+
+  public setUstreamerConfig(config: string): void {
+    this.videoPlaybackUstreamerConfig = config;
+  }
+
+  public async waitForIdle(): Promise<void> {
+    if (this.lifecycle.busy) await new Promise<void>(
+      (resolve) => this.idleResolvers.push(resolve)
+    );
+  }
+
+  public async snapshot(): Promise<SabrSnapshot> {
+    await this.waitForIdle();
+    return {
+      playerTimeMs: this.runtime.playerTimeMs,
+      tracks: this.trackCollection.snapshot()
+    };
+  }
+
+  public async abort(options: AbortOptions = {}): Promise<SabrSnapshot | undefined> {
+    let snapshotData: SabrSnapshot | undefined;
+    if (options.snapshot) snapshotData = await this.snapshot();
+
+    this.emit('abort');
+
+    this.lifecycle.aborted = true;
+
+    this.abortController?.abort();
+    this.trackCollection.error('Stream aborted');
+
+    this.drainResolver?.();
+    this.drainResolver = undefined;
+    this.resumeResolver?.();
+    this.resumeResolver = undefined;
+
+    return snapshotData;
+  }
+
+  public seek(timeMs: number): StreamStartResult | undefined {
+    if (this.lifecycle.aborted || this.lifecycle.errored || this.shouldStop || this.isBroadcast || !this.selectedFormats)
+      return undefined;
+
+    this.seekEpoch += 1;
+    const previous = [ this.trackCollection.video.output, this.trackCollection.audio.output ];
+    this.trackCollection.video.output = this.createTrackStream(this.videoHighWaterMark);
+    this.trackCollection.audio.output = this.createTrackStream(this.audioHighWaterMark);
+
+    for (const track of [ this.trackCollection.video, this.trackCollection.audio ]) {
+      track.discardMediaSegments();
+      if (track.initSegment) track.streamController.enqueue(track.initSegment);
+    }
+
+    this.segmentBuffer.discardPending();
+    this.runtime.playerTimeMs = Math.round(timeMs);
+    this.lastSeekWallMs = Date.now();
+    this.resetProgressTracker(timeMs);
+    this.warming = false;
+
+    for (const output of previous) {
+      try {
+        output.controller.close();
+      } catch { /* already closed */ }
+    }
+
+    this.abortController?.abort();
+    this.drainResolver?.();
+    this.drainResolver = undefined;
+    this.resumeResolver?.();
+    this.resumeResolver = undefined;
+
+    return {
+      videoStream: this.trackCollection.video.output.stream,
+      audioStream: this.trackCollection.audio.output.stream,
+      selectedFormats: this.selectedFormats
+    };
+  }
+
+  public warm(options: SabrPlaybackOptions): void {
+    this.warming = true;
+    this.start(options);
+  }
+
+  public get isWarming(): boolean {
+    return this.warming;
+  }
+
+  public start(options: SabrPlaybackOptions): StreamStartResult {
+    assert(this.runtime.playbackSessionStartMs === undefined, 'This stream instance has already been started and cannot be reused');
+    const { videoFormat, audioFormat } = this.selectFormats(options);
+    this.selectedFormats = { videoFormat, audioFormat };
+
+    this.setupStreaming(options, audioFormat, videoFormat).catch(() => { /* no-op */ });
+
+    return {
+      videoStream: this.trackCollection.video.output.stream,
+      audioStream: this.trackCollection.audio.output.stream,
+      selectedFormats: { videoFormat, audioFormat }
+    };
+  }
+
+  //#endregion
+
+  //#region Internal
+  private createTrackStream(highWaterMark: number): TrackOutput {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream({
+      start: (c) => controller = c,
+      pull: () => this.notifyDrain(),
+      cancel: (reason) => {
+        this.logger.debug(TAG, `Stream cancelled by consumer. Reason: ${reason || 'N/A'}`);
+        this.abort().catch(() => { /* no-op */ });
+      }
+    }, new ByteLengthQueuingStrategy({ highWaterMark }));
+    return { stream, controller };
+  }
+
+  private notifyDrain(): void {
+    if (!this.trackCollection.needsDrain && this.drainResolver) {
+      this.drainResolver();
+      this.drainResolver = undefined;
+    }
+  }
+
+  private waitForDrain(): Promise<void> {
+    if (!this.trackCollection.needsDrain) return Promise.resolve();
+    this.logger.debug(TAG, 'Waiting for drain');
+    return new Promise<void>((resolve) => this.drainResolver = resolve);
+  }
+
+  private validateStreamingUrl(url: URL): void {
+    const broadcastId = getBroadcastId(url);
+    if (broadcastId) this.validateBroadcastId(broadcastId);
+  }
+
+  private validateBroadcastId(bid: string): void {
+    if (this.isBroadcast && (!!this.broadcastId && this.broadcastId !== bid)) {
+      this.logger.warn(TAG, `Broadcast ID changed from ${this.broadcastId} to ${bid}. Stopping.`);
+      this.shouldStop = true;
+    }
+  }
+
+  private selectFormats(options: SabrPlaybackOptions): SelectedFormats {
+    // @NOTE: SABR doesn't support video-only anymore, so no need for special logic for it here.
+    const audioOnly = options.enabledTrackTypes === EnabledTrackTypes.AUDIO_ONLY;
+    const needsVideo = !audioOnly; // for convenience.
+
+    const hasAudioSpecs = !!(options.audioFormat || options.audioPreferences);
+    const hasVideoSpecs = !!(options.videoFormat || options.videoPreferences);
+
+    if (audioOnly) assert(hasAudioSpecs, 'Expected audio format or preferences to be provided');
+    else assert(hasAudioSpecs && hasVideoSpecs, 'Expected both video and audio format or preferences to be provided');
+
+    const audioFormat = chooseFormat(this.formats, options.audioFormat, {
+      isAudio: true,
+      ...options.audioPreferences
+    });
+
+    const videoFormat = needsVideo
+      ? chooseFormat(this.formats, options.videoFormat, {
+        isAudio: false,
+        ...options.videoPreferences
+      })
+      : undefined;
+
+    const missing: string[] = [];
+    if (needsVideo && !videoFormat) missing.push(describeMissingFormat('video', options.videoFormat, this.formats));
+    if (!audioFormat) missing.push(describeMissingFormat('audio', options.audioFormat, this.formats));
+    if (missing.length > 0) throw new Error(`Could not select formats: ${missing.join('; ')}`);
+
+    // Technically, it can never happen, but here to make TS shut up.
+    assertIsDefined(audioFormat, 'Expected selected audio format');
+
+    return { videoFormat, audioFormat };
+  }
+
+  private async setupStreaming(
+    options: SabrPlaybackOptions,
+    audioFormat: SabrFormat,
+    videoFormat?: SabrFormat
+  ): Promise<void> {
+    try {
+      this.logger.debug(TAG, `Starting SABR stream: videoFormat=${videoFormat?.itag ?? 'n/a'}, audioFormat=${audioFormat.itag}, isBroadcast=${this.isBroadcast}, isPostLiveDvr=${options.isPostLiveDvr}`);
+
+      this.tryMintPoToken();
+
+      const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
+      const enabledTrackTypesBitfield = options.enabledTrackTypes ?? EnabledTrackTypes.VIDEO_AND_AUDIO;
+
+      if (options.snapshot && options.snapshot.tracks.length > 0) {
+        const snapshot = options.snapshot;
+
+        if (videoFormat) // missing when downloading only audio.
+          assert(snapshot.tracks.some((track) => createFormatKey(track) === createFormatKey(videoFormat)),
+            'The selected video format does not match any format in the provided snapshot');
+
+        assert(snapshot.tracks.some((track) => createFormatKey(track) === createFormatKey(audioFormat)),
+          'The selected audio format does not match any format in the provided snapshot');
+
+        for (const state of snapshot.tracks)
+          this.trackCollection.initialize(getMediaType(state), state);
+
+        this.seekTo(snapshot.playerTimeMs, 'client');
+      } else this.seekTo(options.startTimeMs ?? (this.isBroadcast && !options.isPostLiveDvr ? LIVE_EDGE_SENTINEL_MS : 0), 'client');
+
+      const abrState: ClientAbrState = {
+        playerTimeMs: this.runtime.playerTimeMs.toString(),
+        audioTrackId: audioFormat?.audioTrackId,
+        clientViewportIsFlexible: false,
+        drcEnabled: audioFormat?.isVb ? false : audioFormat?.isDrc ?? false,
+        mediaCapabilities: buildMediaCapabilities(videoFormat, audioFormat),
+        enableVoiceBoost: audioFormat?.isVb,
+        stickyResolution: videoFormat?.height,
+        elapsedWallTimeMs: '0',
+        timeSinceLastActionMs: '0',
+        timeSinceLastSeek: '0',
+        playbackRate: 1,
+        visibility: 1,
+        enabledTrackTypesBitfield
+      };
+
+      this.runtime.playbackSessionStartMs = Date.now();
+
+      while (!this.shouldStop) {
+        if (this.lifecycle.aborted) {
+          this.logger.debug(TAG, 'Stream aborted');
+          break;
+        }
+
+        const elapsedTimeMs = this.getElapsedWallTimeMs().toString();
+
+        // In a real player, these two would have their own values, but we're downloading so it doesn't matter.. Just need them so that
+        // nextRequestPolicy#targetAudioReadaheadMs and nextRequestPolicy#targetVideoReadaheadMs naturally increase over time.
+        abrState.timeSinceLastSeek = this.lastSeekWallMs !== undefined ? String(Date.now() - this.lastSeekWallMs) : elapsedTimeMs;
+        abrState.timeSinceLastActionMs = elapsedTimeMs;
+        abrState.elapsedWallTimeMs = elapsedTimeMs;
+
+        if (this.runtime.bandwidthEstimateBps > 0)
+          abrState.bandwidthEstimate = Math.round(this.runtime.bandwidthEstimateBps).toString();
+
+        this.logger.debug(TAG, `Starting new segment fetch, playerTimeMs=${abrState.playerTimeMs}, bandwidthEstimate=${abrState.bandwidthEstimate ?? 'n/a'}, elapsedWallTimeMs=${abrState.elapsedWallTimeMs}`);
+
+        this.checkForStall(options.stallDetectionMs);
+
+        const success = await this.executeWithRetry(
+          () => this.fetchAndProcess(
+            abrState,
+            audioFormat,
+            videoFormat
+          ),
+          maxRetries
+        );
+
+        abrState.playerTimeMs = this.runtime.playerTimeMs.toString();
+
+        if (success && this.warming) {
+          await this.waitForSeek(this.seekEpoch);
+          abrState.playerTimeMs = this.runtime.playerTimeMs.toString();
+          continue;
+        }
+
+        if (this.trackCollection.endOfStreamReached(enabledTrackTypesBitfield)) {
+          if (this.isBroadcast) {
+            this.shouldStop = true;
+          } else {
+            const epoch = this.seekEpoch;
+            this.trackCollection.close();
+            this.emit('finish');
+            await this.waitForSeek(epoch);
+            abrState.playerTimeMs = this.runtime.playerTimeMs.toString();
+            continue;
+          }
+        }
+
+        if (this.isBroadcast)
+          this.heartbeat().then();
+
+        if (!success) break;
+      }
+    } catch (error) {
+      if (!this.lifecycle.aborted)
+        this.errorHandler(error as Error);
+    } finally {
+      if (!this.lifecycle.aborted && !this.lifecycle.errored) {
+        this.trackCollection.close();
+        this.emit('finish');
+      }
+
+      this.dispose();
+    }
+  }
+
+  private waitForSeek(epoch: number): Promise<void> {
+    if (this.seekEpoch !== epoch || this.lifecycle.aborted) return Promise.resolve();
+    return new Promise<void>((resolve) => this.resumeResolver = resolve);
+  }
+
+  private async heartbeat(): Promise<void> {
+    const heartbeatParams = this.heartbeatParams;
+    const heartbeatCallback = this.callbacks.onCheckHeartbeat;
+
+    if (!heartbeatCallback || !this.videoId)
+      return;
+
+    const intervalMs = heartbeatParams.intervalMilliseconds !== undefined ? parseInt(heartbeatParams.intervalMilliseconds, 10) : DEFAULT_HEARTBEAT_INTERVAL_MS;
+    const timeSinceLastHeartbeat = Date.now() - this.runtime.lastHeartbeatTimeMs;
+
+    if (timeSinceLastHeartbeat < intervalMs)
+      return;
+
+    try {
+      this.runtime.lastHeartbeatTimeMs = Date.now();
+
+      const heartbeatBody: HeartbeatRequest = {
+        heartbeatRequestParams: {
+          heartbeatChecks: [ 'HEARTBEAT_CHECK_TYPE_LIVE_STREAM_STATUS' ]
+        },
+        videoId: this.videoId
+      };
+
+      if ('heartbeatToken' in heartbeatParams)
+        heartbeatBody.heartbeatToken = heartbeatParams.heartbeatToken;
+
+      if ('heartbeatServerData' in heartbeatParams)
+        heartbeatBody.heartbeatServerData = heartbeatParams.heartbeatServerData;
+
+      const response = await heartbeatCallback(heartbeatBody);
+      if (this.shouldStop) return; // bail early if we stopped during the heartbeat check
+
+      // Not needed, but observed that YouTube does this, so might as well.
+      if ('heartbeatServerData' in response)
+        this.heartbeatParams.heartbeatServerData = response.heartbeatServerData;
+
+      if ('broadcastId' in response && response.broadcastId !== undefined)
+        this.validateBroadcastId(response.broadcastId);
+
+      if (response.status === 'OK') {
+        this.logger.debug(TAG, 'Live stream is online');
+        return;
+      }
+
+      if (response.status === 'LIVE_STREAM_OFFLINE') {
+        if (response.offlineSlatePresent && !response.displayEndscreen) {
+          this.logger.debug(TAG, 'Live stream is offline but not displaying end screen. Continuing.');
+          return;
+        }
+
+        if (!(response.displayEndscreen || response.offlineSlateButtonsPresent))
+          return;
+
+        const elapsedTimeSinceLastProgress = Date.now() - this.progressTracker.lastProgressTime;
+
+        if (elapsedTimeSinceLastProgress > OFFLINE_GRACE_PERIOD_MS) {
+          this.logger.debug(TAG, `Heartbeat check indicates live stream is offline and no activity for ${elapsedTimeSinceLastProgress}ms. Stopping stream.`);
+          this.shouldStop = true;
+          return;
+        }
+
+        this.logger.debug(TAG, `Heartbeat check indicates live stream is offline, but progress was made ${elapsedTimeSinceLastProgress}ms ago. Continuing.`);
+      }
+    } catch (error: unknown) {
+      this.logger.warn(TAG, 'Heartbeat check failed:', (error as Error).message);
+    }
+  }
+
+  private dispose(): void {
+    this.sabrContextUpdates.clear();
+    this.ssapPlaybackInfos.clear();
+    this.activeSabrContextTypes.clear();
+    this.segmentBuffer.reset();
+
+    this.abortController = undefined;
+    this.nextRequestPolicy = undefined;
+
+    this.runtime.spsRejectCount = 0;
+    this.runtime.playerTimeMs = 0;
+    this.runtime.requestNumber = 0;
+    this.runtime.bandwidthEstimateBps = 0;
+    this.isMintingPoToken = false;
+
+    this.resetProgressTracker(0);
+    this.clearRequestTimeout();
+    this.setBusyState(false);
+  }
+
+  private getElapsedWallTimeMs(): number {
+    if (this.runtime.playbackSessionStartMs === undefined) return 0;
+    return Date.now() - this.runtime.playbackSessionStartMs;
+  }
+
+  private checkForStall(stallDetectionMs?: number): void {
+    if (this.isBroadcast && this.runtime.playerTimeMs === LIVE_EDGE_SENTINEL_MS)
+      return; // no progress yet
+
+    const currentTime = Date.now();
+    const stallThreshold = stallDetectionMs ?? DEFAULT_STALL_DETECTION_MS;
+
+    if (currentTime - this.progressTracker.lastProgressTime > stallThreshold) {
+      this.progressTracker.stallCount++;
+
+      this.logger.warn(TAG, `Stream stalled for ${stallThreshold}ms (stall #${this.progressTracker.stallCount})`);
+
+      if (this.progressTracker.stallCount >= MAX_STALLS) {
+        if (this.isBroadcast) {
+          this.logger.warn(TAG, 'Live stream stalled. Assuming end of stream and stopping download');
+          this.shouldStop = true;
+        } else throw new Error(`Stream stalled ${MAX_STALLS} times. Aborting`);
+      }
+
+      this.progressTracker.lastProgressTime = currentTime;
+    }
+  }
+
+  private async executeWithRetry(
+    fetchFn: () => Promise<void>,
+    maxRetries: number
+  ): Promise<boolean> {
+    const backoffTimeMs = (this.nextRequestPolicy?.backoffTimeMs || 0) - (Date.now() - this.nextRequestPolicyReceivedMs);
+
+    if (backoffTimeMs > 0) {
+      this.logger.debug(TAG, `Backing off for ${backoffTimeMs}ms before next request`);
+      await wait(backoffTimeMs);
+    }
+
+    const epoch = this.seekEpoch;
+
+    for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+      // If the stream is aborted during the backoff wait, exit early without making a request.
+      if (this.lifecycle.aborted) {
+        this.logger.debug(TAG, 'Abort requested, preventing new requests');
+        return false;
+      }
+
+      if (this.seekEpoch !== epoch) return true;
+
+      try {
+        this.setBusyState(true);
+        await fetchFn();
+        this.setBusyState(false);
+        return true;
+      } catch (e) {
+        // @NOTE: Don't use a finally block for this. A retry backoff would delay the busy state
+        // from being updated.
+        this.setBusyState(false);
+
+        const error = e as Error;
+
+        // If we abort WHILE processing data, segmentBuffer#finalizeSegment might throw if it is called
+        // because both media streams are closed.
+        if (this.lifecycle.aborted) {
+          this.logger.debug(TAG, 'Abort requested, not retrying fetch');
+          return false;
+        }
+
+        if (this.seekEpoch !== epoch) return true;
+
+        if (attempt > maxRetries) {
+          this.logger.warn(TAG, `Retries exhausted while fetching segment: ${error.message}`);
+          this.errorHandler(error);
+          break;
+        }
+
+        const retryBackoffMs = Math.min(INITIAL_RETRY_BACKOFF_MS * Math.pow(2, attempt - 1), MAX_RETRY_BACKOFF_MS);
+        this.logger.warn(TAG, `Segment fetch attempt ${attempt}/${maxRetries} failed - retrying in ${retryBackoffMs}ms`, error);
+        await wait(retryBackoffMs);
+      }
+    }
+
+    return false;
+  }
+
+  private setBusyState(newState: boolean): void {
+    this.lifecycle.busy = newState;
+    if (!newState) {
+      this.idleResolvers.forEach((resolve) => resolve());
+      this.idleResolvers = [];
+    }
+  }
+
+  private errorHandler(err: Error): void {
+    this.lifecycle.errored = true;
+    this.trackCollection.error(err);
+    this.emit('error', err);
+  }
+
+  private async fetchAndProcess(
+    abrState: ClientAbrState,
+    selectedAudioFormat?: SabrFormat,
+    selectedVideoFormat?: SabrFormat
+  ): Promise<void> {
+    // Keep current gen id so we can detect if it changes during this request.
+    const requestPoTokenGeneration = this.runtime.poTokenGenerationId;
+    const epoch = this.seekEpoch;
+
+    const requestBody = this.buildRequestBody(abrState, selectedAudioFormat, selectedVideoFormat);
+    const response = await this.makeStreamingRequest(requestBody);
+    const contentType = response.headers.get('content-type');
+
+    if (response.status === 403 && this.hasExpired())
+      await this.tryReloadStreamingData();
+
+    assert(response.ok, `Server returned ${response.status} ${response.statusText}`);
+    assert(contentType === 'application/vnd.yt-ump', `Unexpected content type from server: ${contentType}`);
+    assertIsDefined(response.body, 'Response body is null');
+
+    const startTime = performance.now();
+
+    const reader = response.body.getReader();
+
+    let serverSeek = false;
+    let bytesDownloaded = 0;
+
+    //#region UMP Reader
+    const umpReader = new UmpReader({
+      onPart: async (type, data) => {
+        if (this.seekEpoch !== epoch) throw new Error('Superseded by seek');
+        switch (type) {
+          case UMPPartId.SABR_ERROR: {
+            const sabrError = decodePart(data.chunks, SabrError);
+            if (!sabrError) break;
+            throw new Error(`SABR Error: ${sabrError.type} - ${sabrError.code}`);
+          }
+
+          case UMPPartId.FORMAT_INITIALIZATION_METADATA: {
+            const formatInitializationMetadata = decodePart(data.chunks, FormatInitializationMetadata);
+            if (!formatInitializationMetadata) break;
+
+            if (this.videoId !== formatInitializationMetadata.videoId) {
+              this.logger.warn(TAG, `Video ID mismatch: expected ${this.videoId}, got ${formatInitializationMetadata.videoId}. Ignoring format initialization metadata.`);
+              return;
+            }
+
+            if (!this.trackCollection.initializedTracksMap.has(createFormatKey(formatInitializationMetadata))) {
+              const formatType = getMediaType(formatInitializationMetadata);
+              const selectedFormat = formatType === 'video' ? selectedVideoFormat : selectedAudioFormat;
+
+              this.trackCollection.initialize(formatType, {
+                formatId: formatInitializationMetadata.formatId,
+                mimeType: formatInitializationMetadata.mimeType,
+                endTimeTicks: parseInt(formatInitializationMetadata.endTimeTicks || '0'),
+                endTimescale: parseInt(formatInitializationMetadata.endTimeTimescale || '1000'),
+                endSegmentNum: parseInt(formatInitializationMetadata.endSegmentNum || '0'),
+                targetDurationSec: selectedFormat?.targetDurationSec // @NOTE: Not a requirement. We always get it from the EMSG box anyway.
+              });
+
+              this.logger.debug(TAG, `Initialized format: itag=${formatInitializationMetadata.formatId?.itag}, mimeType=${formatInitializationMetadata.mimeType}`);
+
+              this.emit('formatInitialization', this.trackCollection[formatType]);
+            }
+            break;
+          }
+
+          case UMPPartId.MEDIA_HEADER: {
+            const mediaHeader = decodePart(data.chunks, MediaHeader);
+            if (!mediaHeader) break;
+
+            if (this.videoId !== mediaHeader.videoId) {
+              this.logger.warn(TAG, `Video ID mismatch: expected ${this.videoId}, got ${mediaHeader.videoId}. Ignoring media header.`);
+              break;
+            }
+
+            this.logger.debug(TAG, `Received media header: headerId=${mediaHeader.headerId}, itag=${mediaHeader.itag}, segmentNum=${mediaHeader.segmentNum}, startMs=${mediaHeader.startMs}, durationMs=${mediaHeader.durationMs}, segmentLengthBytes=${mediaHeader.segmentLengthBytes}`);
+            this.segmentBuffer.queueMediaHeader(mediaHeader);
+            break;
+          }
+
+          case UMPPartId.MEDIA: {
+            const headerId = data.getUint8(0);
+            const dataBuffer = data.split(1).remainingBuffer;
+            this.segmentBuffer.appendMediaData(headerId, dataBuffer);
+            break;
+          }
+
+          case UMPPartId.MEDIA_END: {
+            const headerId = data.getUint8(0);
+            if (this.segmentBuffer.finalizeSegment(headerId)) {
+              this.recordProgress(this.trackCollection.buffered);
+              this.logger.debug(TAG, `Finalized segment: headerId=${headerId}`);
+              this.emit('trackStateUpdate', this.trackCollection);
+            }
+            break;
+          }
+
+          case UMPPartId.LIVE_METADATA: {
+            const sabrLiveMetadata = decodePart(data.chunks, SabrLiveMetadata);
+            if (!sabrLiveMetadata) break;
+
+            const broadcastId = sabrLiveMetadata.broadcastId;
+            if (broadcastId) this.validateBroadcastId(broadcastId);
+
+            this.emit('liveMetadataUpdate', sabrLiveMetadata);
+            break;
+          }
+
+          case UMPPartId.SABR_SEEK: {
+            const sabrSeek = decodePart(data.chunks, SabrSeek);
+            if (!sabrSeek) break;
+
+            if (sabrSeek.seekSource === SeekSource.SABR_SEEK_TO_HEAD) {
+              const seekTimeMs = ticksToMs(parseInt(sabrSeek.seekMediaTime || '0'), sabrSeek.seekMediaTimescale || 1000, Math.floor);
+              this.seekTo(seekTimeMs, 'server');
+              this.resetProgressTracker(seekTimeMs);
+              this.ssapPlaybackInfos.clear();
+              serverSeek = true;
+            }
+
+            break;
+          }
+
+          case UMPPartId.CUEPOINT_LIST: {
+            const cuepointList = decodePart(data.chunks, CuepointList);
+
+            if (!(cuepointList && 'ssapInfos' in cuepointList))
+              break;
+
+            for (const info of cuepointList.ssapInfos) {
+              const cuepoint = info.cuepoint;
+              const cuepointId = cuepoint?.identifier || '';
+              const timeRange = info.timeRange;
+
+              if (!cuepoint || !timeRange)
+                continue;
+
+              if (cuepoint.event === CuepointEvent.STOP) {
+                this.ssapPlaybackInfos.delete(cuepointId);
+                this.logger.debug(TAG, `Removed cuepoint: identifier=${cuepointId}`);
+              } else {
+                if (this.ssapPlaybackInfos.has(cuepointId))
+                  continue;
+
+                const timescale = timeRange.timescale || 1000;
+                const startTicks = parseInt(timeRange.startTicks || '0');
+                const startTimeMs = String(Math.floor(ticksToMs(startTicks, timescale, Math.floor) - ((cuepoint.playheadTimeSec ?? 0) * 1000)));
+                const durationMs = String((cuepoint.totalDurationSec ?? 0) * 1000);
+
+                this.ssapPlaybackInfos.set(cuepointId, {
+                  adCpns: [],
+                  cuepointId,
+                  startTimeMs,
+                  durationMs,
+                  state: AdState.RATECONTROL_CLIENT
+                });
+
+                this.logger.debug(TAG, `Added new cuepoint: cuepointId=${cuepointId}, startTimeMs=${startTimeMs}, durationMs=${durationMs}`);
+              }
+            }
+            break;
+          }
+
+          case UMPPartId.SABR_CONTEXT_UPDATE: {
+            const contextUpdate = decodePart(data.chunks, SabrContextUpdate);
+            if (!contextUpdate || contextUpdate.type === undefined || !contextUpdate.value?.length)
+              break;
+
+            if (
+              contextUpdate.writePolicy === SabrContextWritePolicy.KEEP_EXISTING &&
+              this.sabrContextUpdates.has(contextUpdate.type)
+            ) break;
+
+            this.sabrContextUpdates.set(contextUpdate.type, contextUpdate);
+
+            if (contextUpdate.sendByDefault)
+              this.activeSabrContextTypes.add(contextUpdate.type);
+
+            break;
+          }
+
+          case UMPPartId.SABR_CONTEXT_SENDING_POLICY: {
+            const contextSendingPolicy = decodePart(data.chunks, SabrContextSendingPolicy);
+            if (!contextSendingPolicy) break;
+
+            for (const startPolicy of contextSendingPolicy.startPolicy) {
+              if (!this.activeSabrContextTypes.has(startPolicy)) {
+                this.activeSabrContextTypes.add(startPolicy);
+                this.logger.debug(TAG, `Activated SABR context: type=${startPolicy}`);
+              }
+            }
+
+            for (const stopPolicy of contextSendingPolicy.stopPolicy) {
+              if (this.activeSabrContextTypes.has(stopPolicy)) {
+                this.activeSabrContextTypes.delete(stopPolicy);
+                this.logger.debug(TAG, `Deactivated SABR context: type=${stopPolicy}`);
+              }
+            }
+
+            for (const discardPolicy of contextSendingPolicy.discardPolicy) {
+              if (this.sabrContextUpdates.has(discardPolicy)) {
+                this.sabrContextUpdates.delete(discardPolicy);
+                this.logger.debug(TAG, `Discarded SABR context: type=${discardPolicy}`);
+              }
+            }
+            break;
+          }
+
+          case UMPPartId.NEXT_REQUEST_POLICY: {
+            this.nextRequestPolicy = decodePart(data.chunks, NextRequestPolicy);
+            this.nextRequestPolicyReceivedMs = Date.now();
+            break;
+          }
+
+          case UMPPartId.STREAM_PROTECTION_STATUS: {
+            const streamProtectionStatus = decodePart(data.chunks, StreamProtectionStatus);
+            if (!streamProtectionStatus || !streamProtectionStatus.status) break;
+
+            this.emit('streamProtectionStatusUpdate', streamProtectionStatus);
+
+            // If this is different, onMintPoToken resolved sometime before this part was received, so we should just ignore it.
+            if (requestPoTokenGeneration !== this.runtime.poTokenGenerationId)
+              break;
+
+            const isRejected = streamProtectionStatus.status === 3;
+            const isPending = streamProtectionStatus.status === 2;
+            const maxRetries = streamProtectionStatus.maxRetries || 5;
+            const spsRejectCount = this.runtime.spsRejectCount;
+
+            assert(spsRejectCount < maxRetries, `Stream protection attestation rejected after ${spsRejectCount} attempts`);
+
+            if ((isRejected || isPending) && !this.isMintingPoToken) {
+              this.logger.warn(TAG,
+                isRejected ?
+                  `Stream protection attestation rejected: attempt ${spsRejectCount} of ${maxRetries}` :
+                  'Stream protection attestation pending');
+
+              if (isRejected)
+                this.runtime.spsRejectCount += 1;
+
+              this.tryMintPoToken();
+            }
+
+            break;
+          }
+
+          case UMPPartId.SABR_REDIRECT: {
+            const sabrRedirect = decodePart(data.chunks, SabrRedirect);
+            if (!sabrRedirect || !sabrRedirect.url) break;
+            this.setStreamingURL(sabrRedirect.url);
+            this.logger.debug(TAG, `Received SABR redirect: newUrl=${sabrRedirect.url}`);
+            break;
+          }
+
+          case UMPPartId.RELOAD_PLAYER_RESPONSE: {
+            const reloadPlaybackContext = decodePart(data.chunks, ReloadPlaybackContext);
+            if (!reloadPlaybackContext) break;
+            this.logger.debug(TAG, `Reload requested: reloadPlaybackParams=${reloadPlaybackContext.reloadPlaybackParams}`);
+            await this.tryReloadStreamingData(reloadPlaybackContext);
+            break;
+          }
+        }
+      }
+    });
+    //#endregion
+
+    const abortController = this.abortController;
+
+    try {
+      while (true) {
+        await this.waitForDrain();
+
+        if (this.seekEpoch !== epoch)
+          break;
+
+        if (abortController?.signal.aborted && !this.lifecycle.aborted)
+          throw new Error('Request timed out');
+
+        // Bail if the stream is manually aborted while waiting for drain.
+        if (this.lifecycle.aborted)
+          break;
+
+        const { done, value } = await reader.read();
+
+        if (done)
+          break;
+
+        if (value.length > 0) {
+          bytesDownloaded += value.length;
+          this.resetRequestTimeout();
+          await umpReader.feed(value);
+        }
+      }
+    } finally {
+      this.clearRequestTimeout();
+      reader.cancel().catch(() => { /* no-op */ });
+      reader.releaseLock();
+      umpReader.dispose();
+    }
+
+    const fetchDurationMs = performance.now() - startTime;
+
+    if (fetchDurationMs > MIN_FETCH_DURATION_FOR_BW_ESTIMATE_MS && bytesDownloaded > 0) {
+      const currentBps = (bytesDownloaded * 8) / (fetchDurationMs / 1000);
+      const bandwidthEstimateBps = this.runtime.bandwidthEstimateBps;
+      this.runtime.bandwidthEstimateBps = bandwidthEstimateBps === 0
+        ? currentBps
+        : BANDWIDTH_EMA_PREVIOUS_WEIGHT * bandwidthEstimateBps + BANDWIDTH_EMA_CURRENT_WEIGHT * currentBps;
+    }
+
+    if (!serverSeek && this.seekEpoch === epoch) {
+      const buffered = this.trackCollection.buffered;
+      if (buffered !== Infinity) {
+        this.seekTo(buffered, 'client');
+      }
+    }
+  }
+
+  private tryMintPoToken(): void {
+    const onMintPoToken = this.callbacks.onMintPoToken;
+
+    if (onMintPoToken) {
+      this.isMintingPoToken = true;
+
+      (async () => {
+        try {
+          this.proofOfOriginToken = await onMintPoToken();
+          this.runtime.poTokenGenerationId += 1;
+        } catch (err: unknown) {
+          this.logger.warn(TAG, `An error occurred while minting proof of origin token: ${(err as Error)?.message}`);
+        } finally {
+          this.isMintingPoToken = false;
+        }
+      })();
+    }
+  }
+
+  private buildRequestBody(
+    abrState: ClientAbrState,
+    selectedAudioFormat?: SabrFormat,
+    selectedVideoFormat?: SabrFormat
+  ): Uint8Array<ArrayBuffer> {
+    const ssapPlaybackInfos = Array.from(this.ssapPlaybackInfos.values());
+    const videoPlaybackUstreamerConfig = base64ToU8(this.videoPlaybackUstreamerConfig);
+    const bufferedRanges = this.trackCollection.bufferedRanges;
+    const playbackCookie = this.nextRequestPolicy?.playbackCookie ? PlaybackCookie.encode(this.nextRequestPolicy.playbackCookie).finish() : undefined;
+    const clientInfo = this.clientInfo;
+    const poToken = this.proofOfOriginToken;
+
+    // No need to set initialization formats for live streams, as every segment is self-initializing.
+    const initializationFormatIds = !this.isBroadcast ? this.trackCollection.initializationFormatIds : [];
+    const selectedAudioFormatIds = selectedAudioFormat ? [ selectedAudioFormat ] : [];
+    const selectedVideoFormatIds = selectedVideoFormat ? [ selectedVideoFormat ] : [];
+
+    const { sabrContexts, unsentSabrContexts } = this.prepareSabrContexts();
+
+    return <Uint8Array<ArrayBuffer>>VideoPlaybackAbrRequest.encode({
+      clientAbrState: abrState,
+      bufferedRanges,
+      ssapPlaybackInfos,
+      initializationFormatIds,
+      selectedAudioFormatIds,
+      selectedVideoFormatIds,
+      selectedCaptionFormatIds: [],
+      videoPlaybackUstreamerConfig,
+      streamerContext: {
+        clientInfo,
+        playbackCookie,
+        unsentSabrContexts,
+        sabrContexts,
+        poToken
+      },
+      field1000: []
+    }).finish();
+  }
+
+  private prepareSabrContexts() {
+    const sabrContexts: SabrContextUpdate[] = [];
+    const unsentSabrContexts: number[] = [];
+
+    for (const [ type, ctxUpdate ] of this.sabrContextUpdates.entries()) {
+      if (this.activeSabrContextTypes.has(type)) sabrContexts.push(ctxUpdate);
+      else unsentSabrContexts.push(type);
+    }
+
+    return { sabrContexts, unsentSabrContexts };
+  }
+
+  private async makeStreamingRequest(body: Uint8Array<ArrayBuffer>): Promise<Response> {
+    const epoch = this.seekEpoch;
+    this.streamingURL.searchParams.set('rn', this.runtime.requestNumber.toString());
+    this.abortController = new AbortController();
+    this.resetRequestTimeout();
+
+    try {
+      return await this.fetchFunction(this.streamingURL, {
+        body,
+        method: 'POST',
+        headers: {
+          'content-type': 'application/x-protobuf',
+          'accept-encoding': 'identity',
+          'accept': 'application/vnd.yt-ump'
+        },
+        redirect: 'follow',
+        signal: this.abortController.signal
+      });
+    } catch (error) {
+      this.clearRequestTimeout();
+
+      if (this.lifecycle.aborted || this.seekEpoch !== epoch) throw error;
+
+      const nextFallbackUrl = getNextFallbackUrl(this.streamingURL);
+      if (nextFallbackUrl) {
+        this.logger.warn(TAG, `Switching to fallback URL: ${nextFallbackUrl.hostname}`);
+        this.setStreamingURL(nextFallbackUrl);
+      }
+
+      throw error;
+    } finally {
+      this.runtime.requestNumber += 1;
+    }
+  }
+
+  private hasExpired(): boolean {
+    const expireRawValue = this.streamingURL.searchParams.get('expire');
+    if (!expireRawValue) return false;
+
+    const expireTimestampMs = parseInt(expireRawValue, 10) * 1000;
+    const msRemaining = expireTimestampMs - Date.now();
+
+    return msRemaining <= 0;
+  }
+
+  private async tryReloadStreamingData(reloadPlaybackContext?: ReloadPlaybackContext): Promise<void> {
+    const onReloadPlayerResponseCb = this.callbacks.onReloadPlayerResponse;
+    if (onReloadPlayerResponseCb) {
+      try {
+        const response = await onReloadPlayerResponseCb(reloadPlaybackContext);
+        this.setStreamingURL(response.serverAbrStreamingUrl);
+        this.setUstreamerConfig(response.videoPlaybackUstreamerConfig);
+
+        this.sabrContextUpdates.clear();
+        this.activeSabrContextTypes.clear();
+        this.ssapPlaybackInfos.clear();
+      } catch (err: unknown) {
+        throw new Error(`An error occurred while reloading streaming data: ${(err as Error)?.message}`);
+      }
+    } else throw new Error('Streaming data reload requested but no handler was found');
+  }
+
+  private resetRequestTimeout(): void {
+    this.clearRequestTimeout();
+    const abortController = this.abortController;
+    this.requestTimeoutId = setTimeout(() => abortController?.abort(), REQUEST_TIMEOUT_MS);
+  }
+
+  private clearRequestTimeout(): void {
+    if (this.requestTimeoutId !== undefined) {
+      clearTimeout(this.requestTimeoutId);
+      this.requestTimeoutId = undefined;
+    }
+  }
+
+  private recordProgress(progressMs: number): void {
+    if (!Number.isFinite(progressMs) || progressMs <= this.progressTracker.lastBufferedTimeMs)
+      return;
+
+    this.progressTracker.lastProgressTime = Date.now();
+    this.progressTracker.lastBufferedTimeMs = progressMs;
+    this.progressTracker.stallCount = 0;
+  }
+
+  private seekTo(timeMs: number, source: 'server' | 'client'): void {
+    this.logger.debug(TAG, `Seeking: timeMs=${timeMs}, source=${source}`);
+    this.runtime.playerTimeMs = Math.round(timeMs);
+  }
+
+  private resetProgressTracker(progressMs: number): void {
+    this.progressTracker = {
+      lastProgressTime: Date.now(),
+      lastBufferedTimeMs: progressMs,
+      stallCount: 0
+    };
+  }
+
+  //#endregion
+}
