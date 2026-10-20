@@ -1,0 +1,10 @@
+{
+  "uiViewClassName": "VideoSurface",
+  "supportsRawText": false,
+  "bubblingEventTypes": {},
+  "directEventTypes": {},
+  "validAttributes": {
+    "resizeMode": true,
+    "hybridRef": true
+  }
+}
