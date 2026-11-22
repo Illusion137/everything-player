@@ -184,6 +184,11 @@ private func filterFormatsByType(_ formats: [SabrFormat], _ isAudio: Bool) -> [S
 
 func buildSabrFormat(_ formatStream: FormatStream) -> SabrFormat {
     let transferCharacteristics = nonEmpty(formatStream.color_info?.transfer_characteristics) ?? formatStream.colorInfo?.transferCharacteristics ?? ""
+    let decodedXtags = decodeXtags(formatStream.xtags)
+
+    let hasVideo = nonEmpty(formatStream.qualityLabel) != nil || nonEmpty(formatStream.quality_label) != nil
+    let hasAudio = nonEmpty(formatStream.audioQuality) != nil || nonEmpty(formatStream.audio_quality) != nil
+    let hasText = formatStream.captionTrack != nil || formatStream.caption_track != nil
 
     var format = SabrFormat(
         itag: formatStream.itag,
@@ -195,7 +200,7 @@ func buildSabrFormat(_ formatStream: FormatStream) -> SabrFormat {
         approxDurationMs: formatStream.approx_duration_ms ?? Int(formatStream.approxDurationMs ?? "0") ?? 0,
         fps: formatStream.fps,
         width: formatStream.width,
-        audioTrackId: nonEmpty(formatStream.audio_track?.id) ?? formatStream.audioTrackId,
+        audioTrackId: nonEmpty(formatStream.audio_track?.id) ?? formatStream.audioTrack?.id,
         quality: formatStream.quality,
         isHdr: transferCharacteristics.contains("SMPTEST2084") || transferCharacteristics.contains("ARIB_STD_B67")
     )
@@ -207,21 +212,49 @@ func buildSabrFormat(_ formatStream: FormatStream) -> SabrFormat {
     let contentLength = Int(formatStream.contentLength ?? "0") ?? 0
     format.contentLength = contentLength != 0 ? contentLength : formatStream.content_length
     format.targetDurationSec = formatStream.targetDurationSec ?? formatStream.target_duration_sec ?? formatStream.target_duration_dec
-    format.hasAudio = !(formatStream.audioQuality ?? formatStream.audio_quality ?? "").isEmpty
-    format.hasVideo = !(formatStream.qualityLabel ?? "").isEmpty && (formatStream.quality_label ?? "").isEmpty
-    format.hasText = formatStream.captionTrack != nil || formatStream.caption_track != nil
-    format.isVb = formatStream.isVb ?? formatStream.is_vb
-    format.isSr = formatStream.isSr ?? formatStream.is_sr
-    format.isDrc = formatStream.is_drc
-    format.isAutoDubbed = formatStream.is_auto_dubbed
-    format.isDescriptive = formatStream.is_descriptive
-    format.isDubbed = formatStream.is_dubbed
-    format.language = formatStream.language
-    format.isOriginal = formatStream.is_original
-    format.isSecondary = formatStream.is_secondary
+    format.hasAudio = hasAudio
+    format.hasVideo = hasVideo
+    format.hasText = hasText
     format.codecCode = CODEC_CODES[formatStream.itag]
 
+    func xtag(_ key: String) -> String? {
+        decodedXtags.first { $0.key == key }?.value
+    }
+
+    if hasVideo {
+        format.isSr = xtag("sr") == "1"
+    }
+
+    if hasAudio || hasText {
+        format.language = formatStream.language ?? xtag("lang")
+
+        if hasAudio {
+            format.isDrc = formatStream.isDrc == true || formatStream.is_drc == true || xtag("drc") == "1"
+            format.isVb = formatStream.isVb == true || formatStream.is_vb == true || xtag("vb") == "1"
+
+            let audioContent = xtag("acont")
+            format.isDubbed = audioContent == "dubbed"
+            format.isDescriptive = audioContent == "descriptive"
+            format.isSecondary = audioContent == "secondary"
+            format.isAutoDubbed = audioContent == "dubbed-auto"
+            format.isOriginal = audioContent == "original" || (
+                format.isDubbed != true && format.isDescriptive != true &&
+                format.isSecondary != true && format.isAutoDubbed != true && format.isDrc != true
+            )
+        }
+
+        if hasText && format.language == nil {
+            format.language = formatStream.caption_track?["language_code"] ?? formatStream.captionTrack?["languageCode"]
+        }
+    }
+
     return format
+}
+
+private func decodeXtags(_ xtags: String?) -> [KeyValuePair] {
+    guard let xtags, !xtags.isEmpty else { return [] }
+    let decoded = xtags.removingPercentEncoding ?? xtags
+    return (try? FormatXTags(serializedBytes: base64ToU8(decoded)))?.xtags ?? []
 }
 
 private func nonEmpty(_ value: String?) -> String? {

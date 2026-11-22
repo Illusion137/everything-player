@@ -15,9 +15,6 @@ private let LIVE_EDGE_SENTINEL_MS = 9_007_199_254_740_991
 private let DEFAULT_VIDEO_HWM = 1024 * 1024 * 16
 private let DEFAULT_AUDIO_HWM = 1024 * 1024 * 3
 
-private let BANDWIDTH_EMA_PREVIOUS_WEIGHT = 0.8
-private let BANDWIDTH_EMA_CURRENT_WEIGHT = 0.2
-private let MIN_FETCH_DURATION_FOR_BW_ESTIMATE_MS = 50.0
 
 
 private enum SeekOrigin: String {
@@ -28,7 +25,6 @@ private enum SeekOrigin: String {
 private struct Runtime {
     var playerTimeMs = 0
     var requestNumber = 0
-    var bandwidthEstimateBps = 0.0
     var lastHeartbeatTimeMs = 0.0
     var playbackSessionStartMs: Double?
     var poTokenGenerationId = 0
@@ -41,7 +37,7 @@ private struct Lifecycle {
     var busy = false
 }
 
-private struct ProgressTracker {
+private struct Health {
     var lastProgressTime = nowMs()
     var lastBufferedTimeMs = 0.0
     var stallCount = 0
@@ -89,7 +85,8 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
 
     private var runtime = Runtime()
     private var lifecycle = Lifecycle()
-    private var progressTracker = ProgressTracker()
+    private var health = Health()
+    private let bandwidth = BandwidthEstimator()
 
     private let callbacks: SabrStreamCallbacks
 
@@ -106,7 +103,7 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
         self.videoHighWaterMark = config.videoHighWaterMark ?? DEFAULT_VIDEO_HWM
         self.audioHighWaterMark = config.audioHighWaterMark ?? DEFAULT_AUDIO_HWM
 
-        let streamingUrl = URL(string: config.serverAbrStreamingUrl)?.settingSearchParam("alr", "no")
+        let streamingUrl = URL(string: config.serverAbrStreamingUrl)
         self.serverAbrStreamingUrl = streamingUrl
 
         let isBroadcast = ["yt_premiere_broadcast", "yt_live_broadcast"].contains(streamingUrl?.searchParam("source") ?? "")
@@ -166,9 +163,8 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
     }
 
     func setStreamingURL(_ url: URL) {
-        let streamingUrl = url.settingSearchParam("alr", "no")
-        serverAbrStreamingUrl = streamingUrl
-        validateStreamingUrl(streamingUrl)
+        serverAbrStreamingUrl = url
+        validateStreamingUrl(url)
     }
 
     func setUstreamerConfig(_ config: String) {
@@ -233,7 +229,7 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
         segmentBuffer.discardPending()
         runtime.playerTimeMs = timeMs
         lastSeekWallMs = nowMs()
-        resetProgressTracker(Double(timeMs))
+        recordActivity(Double(timeMs), reset: true)
         let inFlight = abortController
         let drain = drainResolver
         drainResolver = nil
@@ -435,8 +431,9 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
             abrState.elapsedWallTimeMs = 0
             abrState.timeSinceLastActionMs = 0
             abrState.timeSinceLastSeek = 0
-            abrState.playbackRate = 1
-            abrState.visibility = 1
+            abrState.visibility = 2
+            abrState.enableSabrHostFallback = true
+            abrState.supportsChangeType = false
             abrState.enabledTrackTypesBitfield = Int32(enabledTrackTypesBitfield.rawValue)
 
             runtime.playbackSessionStartMs = nowMs()
@@ -453,9 +450,7 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
                 abrState.timeSinceLastActionMs = elapsedTimeMs
                 abrState.elapsedWallTimeMs = elapsedTimeMs
 
-                if runtime.bandwidthEstimateBps > 0 {
-                    abrState.bandwidthEstimate = Int64(runtime.bandwidthEstimateBps.rounded())
-                }
+                abrState.bandwidthEstimate = Int64(bandwidth.get().rounded())
 
                 logger.debug(TAG, "Starting new segment fetch, playerTimeMs=\(abrState.playerTimeMs), bandwidthEstimate=\(abrState.hasBandwidthEstimate ? String(abrState.bandwidthEstimate) : "n/a"), elapsedWallTimeMs=\(abrState.elapsedWallTimeMs)")
 
@@ -574,7 +569,7 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
                     return
                 }
 
-                let elapsedTimeSinceLastProgress = nowMs() - progressTracker.lastProgressTime
+                let elapsedTimeSinceLastProgress = nowMs() - health.lastProgressTime
 
                 if elapsedTimeSinceLastProgress > OFFLINE_GRACE_PERIOD_MS {
                     logger.debug(TAG, "Heartbeat check indicates live stream is offline and no activity for \(elapsedTimeSinceLastProgress)ms. Stopping stream.")
@@ -601,10 +596,11 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
         runtime.spsRejectCount = 0
         runtime.playerTimeMs = 0
         runtime.requestNumber = 0
-        runtime.bandwidthEstimateBps = 0
+        bandwidth.reset()
+
         isMintingPoToken = false
 
-        resetProgressTracker(0)
+        recordActivity(0, reset: true)
         clearRequestTimeout()
         setBusyState(false)
     }
@@ -622,12 +618,12 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
         let currentTime = nowMs()
         let stallThreshold = stallDetectionMs ?? DEFAULT_STALL_DETECTION_MS
 
-        if currentTime - progressTracker.lastProgressTime > Double(stallThreshold) {
-            progressTracker.stallCount += 1
+        if currentTime - health.lastProgressTime > Double(stallThreshold) {
+            health.stallCount += 1
 
-            logger.warn(TAG, "Stream stalled for \(stallThreshold)ms (stall #\(progressTracker.stallCount))")
+            logger.warn(TAG, "Stream stalled for \(stallThreshold)ms (stall #\(health.stallCount))")
 
-            if progressTracker.stallCount >= MAX_STALLS {
+            if health.stallCount >= MAX_STALLS {
                 if isBroadcast {
                     logger.warn(TAG, "Live stream stalled. Assuming end of stream and stopping download")
                     shouldStop = true
@@ -636,7 +632,7 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
                 }
             }
 
-            progressTracker.lastProgressTime = currentTime
+            health.lastProgressTime = currentTime
         }
     }
 
@@ -722,7 +718,6 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
         let epoch = currentSeekEpoch
 
         let requestBody = try buildRequestBody(abrState, selectedAudioFormat, selectedVideoFormat)
-        let startTime = nowMs()
         let fetched = try await makeStreamingRequest(requestBody)
         let response = fetched.response
         let contentType = response.value(forHTTPHeaderField: "content-type")
@@ -740,7 +735,6 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
         }
 
         var serverSeek = false
-        var bytesDownloaded = 0
 
         let umpReader = UmpReader(UmpReaderCallbacks(onPart: { type, data in
             if self.currentSeekEpoch != epoch { throw CancellationError() }
@@ -794,7 +788,7 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
             case .mediaEnd:
                 let headerId = Int(data.getUint8(0))
                 if try self.segmentBuffer.finalizeSegment(headerId) {
-                    self.recordProgress(self.trackCollection.buffered)
+                    self.recordActivity(self.trackCollection.buffered)
                     self.logger.debug(TAG, "Finalized segment: headerId=\(headerId)")
                     self.emit(.trackStateUpdate, self.trackCollection)
                 }
@@ -814,7 +808,7 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
                 if sabrSeek.seekSource == .sabrSeekToHead {
                     let seekTimeMs = ticksToMs(Int(sabrSeek.seekMediaTime), sabrSeek.seekMediaTimescale != 0 ? Int(sabrSeek.seekMediaTimescale) : 1000, floor)
                     self.seekTo(seekTimeMs, .server)
-                    self.resetProgressTracker(Double(seekTimeMs))
+                    self.recordActivity(Double(seekTimeMs), reset: true)
                     self.ssapPlaybackInfos.removeAll()
                     serverSeek = true
                 }
@@ -951,8 +945,11 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
 
         abortController?.onAbort(fetched.cancel)
 
+        var isFirstChunk = true
+
         do {
-            for try await value in fetched.body {
+            var iterator = fetched.body.makeAsyncIterator()
+            while true {
                 await waitForDrain()
 
                 if abortController?.aborted == true && !lifecycle.aborted {
@@ -963,8 +960,15 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
                     break
                 }
 
+                let readStart = nowMs()
+                guard let value = try await iterator.next() else { break }
+                let readSec = (nowMs() - readStart) / 1000
+
                 if value.count > 0 {
-                    bytesDownloaded += value.count
+                    if !isFirstChunk {
+                        bandwidth.add(value.count, readSec)
+                    }
+                    isFirstChunk = false
                     resetRequestTimeout()
                     try await umpReader.feed(value)
                 }
@@ -982,16 +986,6 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
         fetched.cancel()
         clearRequestTimeout()
         umpReader.dispose()
-
-        let fetchDurationMs = nowMs() - startTime
-
-        if fetchDurationMs > MIN_FETCH_DURATION_FOR_BW_ESTIMATE_MS && bytesDownloaded > 0 {
-            let currentBps = Double(bytesDownloaded * 8) / (fetchDurationMs / 1000)
-            let bandwidthEstimateBps = runtime.bandwidthEstimateBps
-            runtime.bandwidthEstimateBps = bandwidthEstimateBps == 0
-                ? currentBps
-                : BANDWIDTH_EMA_PREVIOUS_WEIGHT * bandwidthEstimateBps + BANDWIDTH_EMA_CURRENT_WEIGHT * currentBps
-        }
 
         if !serverSeek && currentSeekEpoch == epoch {
             let buffered = trackCollection.buffered
@@ -1025,7 +1019,7 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
         let ssapPlaybackInfos = self.ssapPlaybackInfos.values
         let videoPlaybackUstreamerConfig = base64ToU8(self.videoPlaybackUstreamerConfig)
         let bufferedRanges = trackCollection.bufferedRanges
-        let playbackCookie = nextRequestPolicy?.hasPlaybackCookie == true ? try nextRequestPolicy!.playbackCookie.serializedData() : nil
+        let playbackCookie = nextRequestPolicy?.hasPlaybackCookie == true ? nextRequestPolicy!.playbackCookie : nil
         let poToken = proofOfOriginToken
 
         let initializationFormatIds = !isBroadcast ? trackCollection.initializationFormatIds : []
@@ -1151,26 +1145,18 @@ final class SabrStream: EventEmitterLike, @unchecked Sendable {
         requestTimeoutTask = nil
     }
 
-    private func recordProgress(_ progressMs: Double) {
-        if !progressMs.isFinite || progressMs <= progressTracker.lastBufferedTimeMs {
+    private func recordActivity(_ progressMs: Double, reset: Bool = false) {
+        if !reset && (!progressMs.isFinite || progressMs <= health.lastBufferedTimeMs) {
             return
         }
 
-        progressTracker.lastProgressTime = nowMs()
-        progressTracker.lastBufferedTimeMs = progressMs
-        progressTracker.stallCount = 0
+        health.lastProgressTime = nowMs()
+        health.lastBufferedTimeMs = progressMs
+        health.stallCount = 0
     }
 
     private func seekTo(_ timeMs: Int, _ source: SeekOrigin) {
         logger.debug(TAG, "Seeking: timeMs=\(timeMs), source=\(source.rawValue)")
         runtime.playerTimeMs = timeMs
-    }
-
-    private func resetProgressTracker(_ progressMs: Double) {
-        progressTracker = ProgressTracker(
-            lastProgressTime: nowMs(),
-            lastBufferedTimeMs: progressMs,
-            stallCount: 0
-        )
     }
 }

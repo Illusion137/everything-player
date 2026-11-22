@@ -82,13 +82,13 @@ data class FormatStream(
   var quality_label: String? = null
   var qualityLabel: String? = null
   var audio_track: AudioTrack? = null
-  var audioTrackId: String? = null
   var audioChannels: Int? = null
   var audio_channels: Int? = null
   var caption_track: Map<String, String>? = null
   var captionTrack: Map<String, String>? = null
   var color_info: FormatColorInfo? = null
   var colorInfo: FormatColorInfo? = null
+  var audioTrack: AudioTrack? = null
   var is_drc: Boolean? = null
   var isDrc: Boolean? = null
   var isVb: Boolean? = null

@@ -40,6 +40,7 @@ import com.margelo.nitro.everythingplayer.googlevideo.types.TrackOutput
 import com.margelo.nitro.everythingplayer.googlevideo.types.TrackState
 import com.margelo.nitro.everythingplayer.googlevideo.types.defaultFetchFunction
 import com.margelo.nitro.everythingplayer.googlevideo.utils.AbortController
+import com.margelo.nitro.everythingplayer.googlevideo.utils.BandwidthEstimator
 import com.margelo.nitro.everythingplayer.googlevideo.utils.ClientInfo
 import com.margelo.nitro.everythingplayer.googlevideo.utils.CuepointEvent
 import com.margelo.nitro.everythingplayer.googlevideo.utils.EnabledTrackTypes
@@ -102,9 +103,6 @@ private const val LIVE_EDGE_SENTINEL_MS = 9_007_199_254_740_991L
 private const val DEFAULT_VIDEO_HWM = 1024 * 1024 * 16
 private const val DEFAULT_AUDIO_HWM = 1024 * 1024 * 3
 
-private const val BANDWIDTH_EMA_PREVIOUS_WEIGHT = 0.8
-private const val BANDWIDTH_EMA_CURRENT_WEIGHT = 0.2
-private const val MIN_FETCH_DURATION_FOR_BW_ESTIMATE_MS = 50.0
 
 private enum class SeekOrigin(val rawValue: String) {
   SERVER("server"),
@@ -114,7 +112,6 @@ private enum class SeekOrigin(val rawValue: String) {
 private class Runtime {
   @Volatile var playerTimeMs = 0L
   @Volatile var requestNumber = 0
-  @Volatile var bandwidthEstimateBps = 0.0
   @Volatile var lastHeartbeatTimeMs = 0.0
   @Volatile var playbackSessionStartMs: Double? = null
   @Volatile var poTokenGenerationId = 0
@@ -127,7 +124,7 @@ private class Lifecycle {
   @Volatile var busy = false
 }
 
-private class ProgressTracker(
+private class Health(
   var lastProgressTime: Double = nowMs(),
   var lastBufferedTimeMs: Double = 0.0,
   var stallCount: Int = 0,
@@ -176,12 +173,13 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
 
   private val runtime = Runtime()
   private val lifecycle = Lifecycle()
-  @Volatile private var progressTracker = ProgressTracker()
+  @Volatile private var health = Health()
+  private val bandwidth = BandwidthEstimator()
 
   private val callbacks: SabrStreamCallbacks = config.callbacks ?: SabrStreamCallbacks()
 
   init {
-    val streamingUrl = config.serverAbrStreamingUrl.settingSearchParam("alr", "no")
+    val streamingUrl = config.serverAbrStreamingUrl
     serverAbrStreamingUrl = streamingUrl
 
     val isBroadcast = listOf("yt_premiere_broadcast", "yt_live_broadcast").contains(streamingUrl.searchParam("source") ?: "")
@@ -226,9 +224,8 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
     get() = assertIsDefined(serverAbrStreamingUrl, "Streaming URL is not set")
 
   fun setStreamingURL(url: String) {
-    val streamingUrl = url.settingSearchParam("alr", "no")
-    serverAbrStreamingUrl = streamingUrl
-    validateStreamingUrl(streamingUrl)
+    serverAbrStreamingUrl = url
+    validateStreamingUrl(url)
   }
 
   fun setUstreamerConfig(config: String) {
@@ -299,7 +296,7 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
       segmentBuffer.discardPending()
       runtime.playerTimeMs = toMs
       lastSeekWallMs = nowMs()
-      resetProgressTracker(toMs.toDouble())
+      recordActivity(toMs.toDouble(), reset = true)
       inFlight = abortController
       drain = drainResolver
       drainResolver = null
@@ -496,8 +493,9 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
       abrState.setElapsedWallTimeMs(0)
       abrState.setTimeSinceLastActionMs(0)
       abrState.setTimeSinceLastSeek(0)
-      abrState.setPlaybackRate(1f)
-      abrState.setVisibility(1)
+      abrState.setVisibility(2)
+      abrState.setEnableSabrHostFallback(true)
+      abrState.setSupportsChangeType(false)
       abrState.setEnabledTrackTypesBitfield(enabledTrackTypesBitfield.rawValue)
 
       runtime.playbackSessionStartMs = nowMs()
@@ -514,9 +512,7 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
         abrState.setTimeSinceLastActionMs(elapsedTimeMs)
         abrState.setElapsedWallTimeMs(elapsedTimeMs)
 
-        if (runtime.bandwidthEstimateBps > 0) {
-          abrState.setBandwidthEstimate(Math.round(runtime.bandwidthEstimateBps))
-        }
+        abrState.setBandwidthEstimate(Math.round(bandwidth.get()))
 
         logger.debug(TAG, "Starting new segment fetch, playerTimeMs=${abrState.playerTimeMs}, bandwidthEstimate=${if (abrState.hasBandwidthEstimate()) abrState.bandwidthEstimate.toString() else "n/a"}, elapsedWallTimeMs=${abrState.elapsedWallTimeMs}")
 
@@ -630,7 +626,7 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
           return
         }
 
-        val elapsedTimeSinceLastProgress = nowMs() - progressTracker.lastProgressTime
+        val elapsedTimeSinceLastProgress = nowMs() - health.lastProgressTime
 
         if (elapsedTimeSinceLastProgress > OFFLINE_GRACE_PERIOD_MS) {
           logger.debug(TAG, "Heartbeat check indicates live stream is offline and no activity for ${elapsedTimeSinceLastProgress}ms. Stopping stream.")
@@ -657,10 +653,11 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
     runtime.spsRejectCount = 0
     runtime.playerTimeMs = 0
     runtime.requestNumber = 0
-    runtime.bandwidthEstimateBps = 0.0
+    bandwidth.reset()
+
     isMintingPoToken = false
 
-    resetProgressTracker(0.0)
+    recordActivity(0.0, reset = true)
     clearRequestTimeout()
     setBusyState(false)
   }
@@ -678,12 +675,12 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
     val currentTime = nowMs()
     val stallThreshold = stallDetectionMs ?: DEFAULT_STALL_DETECTION_MS
 
-    if (currentTime - progressTracker.lastProgressTime > stallThreshold.toDouble()) {
-      progressTracker.stallCount += 1
+    if (currentTime - health.lastProgressTime > stallThreshold.toDouble()) {
+      health.stallCount += 1
 
-      logger.warn(TAG, "Stream stalled for ${stallThreshold}ms (stall #${progressTracker.stallCount})")
+      logger.warn(TAG, "Stream stalled for ${stallThreshold}ms (stall #${health.stallCount})")
 
-      if (progressTracker.stallCount >= MAX_STALLS) {
+      if (health.stallCount >= MAX_STALLS) {
         if (isBroadcast) {
           logger.warn(TAG, "Live stream stalled. Assuming end of stream and stopping download")
           shouldStop = true
@@ -692,7 +689,7 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
         }
       }
 
-      progressTracker.lastProgressTime = currentTime
+      health.lastProgressTime = currentTime
     }
   }
 
@@ -780,7 +777,6 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
     val epoch = currentSeekEpoch
 
     val requestBody = buildRequestBody(abrState, selectedAudioFormat, selectedVideoFormat)
-    val startTime = nowMs()
     val fetched = makeStreamingRequest(requestBody)
     val response = fetched.response
     val contentType = response.value(forHTTPHeaderField = "content-type")
@@ -798,7 +794,6 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
     }
 
     var serverSeek = false
-    var bytesDownloaded = 0L
 
     val umpReader = UmpReader(
       UmpReaderCallbacks(onPart = onPart@{ type, data ->
@@ -860,7 +855,7 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
           UMPPartId.MEDIA_END -> {
             val headerId = data.getUint8(0)
             if (segmentBuffer.finalizeSegment(headerId)) {
-              recordProgress(trackCollection.buffered)
+              recordActivity(trackCollection.buffered)
               logger.debug(TAG, "Finalized segment: headerId=$headerId")
               emit(SabrStreamEvent.trackStateUpdate, trackCollection)
             }
@@ -882,7 +877,7 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
             if (sabrSeek.seekSource == SeekSource.SEEK_SOURCE_SABR_SEEK_TO_HEAD) {
               val seekTimeMs = ticksToMs(sabrSeek.seekMediaTime, if (sabrSeek.seekMediaTimescale != 0) sabrSeek.seekMediaTimescale.toLong() else 1000, ::floor)
               seekTo(seekTimeMs, SeekOrigin.SERVER)
-              resetProgressTracker(seekTimeMs.toDouble())
+              recordActivity(seekTimeMs.toDouble(), reset = true)
               ssapPlaybackInfos.clear()
               serverSeek = true
             }
@@ -1031,8 +1026,11 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
 
     abortController?.onAbort(fetched.cancel)
 
+    var isFirstChunk = true
+
     try {
-      for (value in fetched.body) {
+      val iterator = fetched.body.iterator()
+      while (true) {
         waitForDrain()
 
         if (abortController?.aborted == true && !lifecycle.aborted) {
@@ -1043,8 +1041,16 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
           break
         }
 
+        val readStart = nowMs()
+        if (!iterator.hasNext()) break
+        val value = iterator.next()
+        val readSec = (nowMs() - readStart) / 1000
+
         if (value.isNotEmpty()) {
-          bytesDownloaded += value.size
+          if (!isFirstChunk) {
+            bandwidth.add(value.size, readSec)
+          }
+          isFirstChunk = false
           resetRequestTimeout()
           umpReader.feed(value)
         }
@@ -1062,18 +1068,6 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
     fetched.cancel()
     clearRequestTimeout()
     umpReader.dispose()
-
-    val fetchDurationMs = nowMs() - startTime
-
-    if (fetchDurationMs > MIN_FETCH_DURATION_FOR_BW_ESTIMATE_MS && bytesDownloaded > 0) {
-      val currentBps = (bytesDownloaded * 8).toDouble() / (fetchDurationMs / 1000)
-      val bandwidthEstimateBps = runtime.bandwidthEstimateBps
-      runtime.bandwidthEstimateBps = if (bandwidthEstimateBps == 0.0) {
-        currentBps
-      } else {
-        BANDWIDTH_EMA_PREVIOUS_WEIGHT * bandwidthEstimateBps + BANDWIDTH_EMA_CURRENT_WEIGHT * currentBps
-      }
-    }
 
     if (!serverSeek && currentSeekEpoch == epoch) {
       val buffered = trackCollection.buffered
@@ -1108,7 +1102,7 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
     val videoPlaybackUstreamerConfig = base64ToU8(videoPlaybackUstreamerConfig)
     val bufferedRanges = trackCollection.bufferedRanges
     val nextRequestPolicy = nextRequestPolicy
-    val playbackCookie = if (nextRequestPolicy?.hasPlaybackCookie() == true) nextRequestPolicy.playbackCookie.toByteString() else null
+    val playbackCookie = if (nextRequestPolicy?.hasPlaybackCookie() == true) nextRequestPolicy.playbackCookie else null
     val poToken = proofOfOriginToken
 
     val initializationFormatIds = if (!isBroadcast) trackCollection.initializationFormatIds else emptyList()
@@ -1234,26 +1228,18 @@ class SabrStream(config: SabrStreamConfig) : EventEmitterLike() {
     requestTimeoutTask = null
   }
 
-  private fun recordProgress(progressMs: Double) {
-    if (!progressMs.isFinite() || progressMs <= progressTracker.lastBufferedTimeMs) {
+  private fun recordActivity(progressMs: Double, reset: Boolean = false) {
+    if (!reset && (!progressMs.isFinite() || progressMs <= health.lastBufferedTimeMs)) {
       return
     }
 
-    progressTracker.lastProgressTime = nowMs()
-    progressTracker.lastBufferedTimeMs = progressMs
-    progressTracker.stallCount = 0
+    health.lastProgressTime = nowMs()
+    health.lastBufferedTimeMs = progressMs
+    health.stallCount = 0
   }
 
   private fun seekTo(timeMs: Long, source: SeekOrigin) {
     logger.debug(TAG, "Seeking: timeMs=$timeMs, source=${source.rawValue}")
     runtime.playerTimeMs = timeMs
-  }
-
-  private fun resetProgressTracker(progressMs: Double) {
-    progressTracker = ProgressTracker(
-      lastProgressTime = nowMs(),
-      lastBufferedTimeMs = progressMs,
-      stallCount = 0,
-    )
   }
 }

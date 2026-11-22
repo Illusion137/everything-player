@@ -2,6 +2,8 @@ package com.margelo.nitro.everythingplayer.googlevideo.utils
 
 import com.margelo.nitro.everythingplayer.googlevideo.core.GoogleVideoError
 import com.margelo.nitro.everythingplayer.googlevideo.protos.misc.FormatId
+import com.margelo.nitro.everythingplayer.googlevideo.protos.misc.FormatXTags
+import com.margelo.nitro.everythingplayer.googlevideo.protos.misc.KeyValuePair
 import com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming.FormatInitializationMetadata
 import com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming.MediaHeader
 import com.margelo.nitro.everythingplayer.googlevideo.types.AudioFormatPreferences
@@ -175,6 +177,11 @@ private fun filterFormatsByType(formats: List<SabrFormat>, isAudio: Boolean): Li
 
 fun buildSabrFormat(formatStream: FormatStream): SabrFormat {
   val transferCharacteristics = nonEmpty(formatStream.color_info?.transfer_characteristics) ?: formatStream.colorInfo?.transferCharacteristics ?: ""
+  val decodedXtags = decodeXtags(formatStream.xtags)
+
+  val hasVideo = nonEmpty(formatStream.qualityLabel) != null || nonEmpty(formatStream.quality_label) != null
+  val hasAudio = nonEmpty(formatStream.audioQuality) != null || nonEmpty(formatStream.audio_quality) != null
+  val hasText = formatStream.captionTrack != null || formatStream.caption_track != null
 
   val format = SabrFormat(
     itag = formatStream.itag,
@@ -186,7 +193,7 @@ fun buildSabrFormat(formatStream: FormatStream): SabrFormat {
     approxDurationMs = formatStream.approx_duration_ms ?: (formatStream.approxDurationMs ?: "0").toLongOrNull() ?: 0,
     fps = formatStream.fps,
     width = formatStream.width,
-    audioTrackId = nonEmpty(formatStream.audio_track?.id) ?: formatStream.audioTrackId,
+    audioTrackId = nonEmpty(formatStream.audio_track?.id) ?: formatStream.audioTrack?.id,
     quality = formatStream.quality,
     isHdr = transferCharacteristics.contains("SMPTEST2084") || transferCharacteristics.contains("ARIB_STD_B67"),
   )
@@ -198,21 +205,47 @@ fun buildSabrFormat(formatStream: FormatStream): SabrFormat {
   val contentLength = (formatStream.contentLength ?: "0").toLongOrNull() ?: 0
   format.contentLength = if (contentLength != 0L) contentLength else formatStream.content_length
   format.targetDurationSec = formatStream.targetDurationSec ?: formatStream.target_duration_sec ?: formatStream.target_duration_dec
-  format.hasAudio = !(formatStream.audioQuality ?: formatStream.audio_quality ?: "").isEmpty()
-  format.hasVideo = !(formatStream.qualityLabel ?: "").isEmpty() && (formatStream.quality_label ?: "").isEmpty()
-  format.hasText = formatStream.captionTrack != null || formatStream.caption_track != null
-  format.isVb = formatStream.isVb ?: formatStream.is_vb
-  format.isSr = formatStream.isSr ?: formatStream.is_sr
-  format.isDrc = formatStream.is_drc
-  format.isAutoDubbed = formatStream.is_auto_dubbed
-  format.isDescriptive = formatStream.is_descriptive
-  format.isDubbed = formatStream.is_dubbed
-  format.language = formatStream.language
-  format.isOriginal = formatStream.is_original
-  format.isSecondary = formatStream.is_secondary
+  format.hasAudio = hasAudio
+  format.hasVideo = hasVideo
+  format.hasText = hasText
   format.codecCode = CODEC_CODES[formatStream.itag]
 
+  fun xtag(key: String): String? = decodedXtags.firstOrNull { it.key == key }?.value
+
+  if (hasVideo) {
+    format.isSr = xtag("sr") == "1"
+  }
+
+  if (hasAudio || hasText) {
+    format.language = formatStream.language ?: xtag("lang")
+
+    if (hasAudio) {
+      format.isDrc = formatStream.isDrc == true || formatStream.is_drc == true || xtag("drc") == "1"
+      format.isVb = formatStream.isVb == true || formatStream.is_vb == true || xtag("vb") == "1"
+
+      val audioContent = xtag("acont")
+      format.isDubbed = audioContent == "dubbed"
+      format.isDescriptive = audioContent == "descriptive"
+      format.isSecondary = audioContent == "secondary"
+      format.isAutoDubbed = audioContent == "dubbed-auto"
+      format.isOriginal = audioContent == "original" || (
+        format.isDubbed != true && format.isDescriptive != true &&
+          format.isSecondary != true && format.isAutoDubbed != true && format.isDrc != true
+        )
+    }
+
+    if (hasText && format.language == null) {
+      format.language = formatStream.caption_track?.get("language_code") ?: formatStream.captionTrack?.get("languageCode")
+    }
+  }
+
   return format
+}
+
+private fun decodeXtags(xtags: String?): List<KeyValuePair> {
+  if (xtags.isNullOrEmpty()) return emptyList()
+  val decoded = runCatching { java.net.URLDecoder.decode(xtags.replace("+", "%2B"), "UTF-8") }.getOrDefault(xtags)
+  return runCatching { FormatXTags.parseFrom(base64ToU8(decoded)).xtagsList }.getOrDefault(emptyList())
 }
 
 private fun nonEmpty(value: String?): String? = if (value.isNullOrEmpty()) null else value

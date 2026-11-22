@@ -51,6 +51,7 @@ typealias FormatSelectionConfig = VideoStreaming_FormatSelectionConfig
 
 typealias FormatId = Misc_FormatId
 typealias KeyValuePair = Misc_KeyValuePair
+typealias FormatXTags = Misc_FormatXTags
 typealias HttpHeader = Misc_HttpHeader
 typealias IdentifierToken = Misc_IdentifierToken
 typealias CompressionType = Misc_CompressionType

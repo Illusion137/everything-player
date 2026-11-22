@@ -2,6 +2,7 @@ export * from './Logger.js';
 export * from './Track.js';
 export * from './TrackCollection.js';
 export * from './EventEmitterLike.js';
+export * from './BandwidthEstimator.js';
 export * from './formatUtils.js';
 export * from './mediaSegmentUtils.js';
 export * from './mediaTimeUtils.js';

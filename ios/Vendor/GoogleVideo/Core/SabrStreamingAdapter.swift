@@ -53,7 +53,7 @@ final class SabrStreamingAdapter: @unchecked Sendable {
     private var sabrFormats: [SabrFormat] = []
     private var sabrContexts = OrderedMap<Int, SabrContextUpdate>()
     private var activeSabrContextTypes = Set<Int>()
-    private var lastPlaybackCookie: PlaybackCookie?
+    private var lastPlaybackCookie: Data?
     private var lastPlayerTimeSecs = 0.0
     private var cacheManager: CacheManager?
     private var requestNumber = 0
@@ -266,7 +266,7 @@ final class SabrStreamingAdapter: @unchecked Sendable {
             streamerContext.poToken = base64ToU8(try await onMintPoTokenCallback())
         }
         if let lastPlaybackCookie {
-            streamerContext.playbackCookie = try lastPlaybackCookie.serializedData()
+            streamerContext.playbackCookie = lastPlaybackCookie
         }
         if let clientInfo = options.clientInfo {
             streamerContext.clientInfo = clientInfo
@@ -407,7 +407,7 @@ final class SabrStreamingAdapter: @unchecked Sendable {
         }
 
         if let nextRequestPolicy = streamInfo.nextRequestPolicy {
-            lastPlaybackCookie = nextRequestPolicy.playbackCookie
+            lastPlaybackCookie = nextRequestPolicy.hasPlaybackCookie ? nextRequestPolicy.playbackCookie : nil
             let delayMs = Int(nextRequestPolicy.backoffTimeMs)
 
             if delayMs > 0 && activeDelayPromise == nil {

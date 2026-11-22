@@ -141,13 +141,13 @@ struct FormatStream: Sendable {
     var quality_label: String?
     var qualityLabel: String?
     var audio_track: AudioTrack?
-    var audioTrackId: String?
     var audioChannels: Int?
     var audio_channels: Int?
     var caption_track: [String: String]?
     var captionTrack: [String: String]?
     var color_info: FormatColorInfo?
     var colorInfo: FormatColorInfo?
+    var audioTrack: AudioTrack?
     var is_drc: Bool?
     var isDrc: Bool?
     var isVb: Bool?

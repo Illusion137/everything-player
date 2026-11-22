@@ -4,7 +4,6 @@ import com.google.protobuf.ByteString
 import com.margelo.nitro.everythingplayer.googlevideo.protos.misc.FormatId
 import com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming.BufferedRange
 import com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming.ClientAbrState
-import com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming.PlaybackCookie
 import com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming.SabrContextUpdate
 import com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming.StreamerContext
 import com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming.TimeRange
@@ -85,7 +84,7 @@ class SabrStreamingAdapter(options: SabrOptions) {
   private var sabrFormats: List<SabrFormat> = emptyList()
   private val sabrContexts = OrderedMap<Int, SabrContextUpdate>()
   private val activeSabrContextTypes = LinkedHashSet<Int>()
-  private var lastPlaybackCookie: PlaybackCookie? = null
+  private var lastPlaybackCookie: ByteString? = null
   private var lastPlayerTimeSecs = 0.0
   private var cacheManager: CacheManager? = null
   private var requestNumber = 0
@@ -293,7 +292,7 @@ class SabrStreamingAdapter(options: SabrOptions) {
 
     val streamerContext = StreamerContext.newBuilder()
     onMintPoTokenCallback?.let { streamerContext.setPoToken(ByteString.copyFrom(base64ToU8(it()))) }
-    lastPlaybackCookie?.let { streamerContext.setPlaybackCookie(it.toByteString()) }
+    lastPlaybackCookie?.let { streamerContext.setPlaybackCookie(it) }
     options?.clientInfo?.let { streamerContext.setClientInfo(it) }
 
     for (ctxUpdate in sabrContexts.values) {
@@ -436,7 +435,7 @@ class SabrStreamingAdapter(options: SabrOptions) {
 
     val nextRequestPolicy = streamInfo.nextRequestPolicy
     if (nextRequestPolicy != null) {
-      lastPlaybackCookie = nextRequestPolicy.playbackCookie
+      lastPlaybackCookie = if (nextRequestPolicy.hasPlaybackCookie()) nextRequestPolicy.playbackCookie else null
       val delayMs = nextRequestPolicy.backoffTimeMs.toLong()
 
       if (delayMs > 0 && activeDelayPromise == null) {

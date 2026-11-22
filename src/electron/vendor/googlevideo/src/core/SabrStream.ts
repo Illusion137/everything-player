@@ -29,7 +29,6 @@ import {
   FormatInitializationMetadata,
   MediaHeader,
   NextRequestPolicy,
-  PlaybackCookie,
   ReloadPlaybackContext,
   SabrContextSendingPolicy,
   SabrContextUpdate,
@@ -52,6 +51,7 @@ import { base64ToU8, decodePart } from '../utils/uint8arrayUtils.js';
 import { getBroadcastId, getNextFallbackUrl } from '../utils/urlUtils.js';
 import { buildMediaCapabilities } from '../utils/mediaCapabilityUtils.js';
 import { TrackCollection } from '../utils/TrackCollection.js';
+import { BandwidthEstimator } from '../utils/BandwidthEstimator.js';
 
 const TAG = 'SabrStream';
 
@@ -67,10 +67,6 @@ const LIVE_EDGE_SENTINEL_MS = Number.MAX_SAFE_INTEGER;
 
 const DEFAULT_VIDEO_HWM = 1024 * 1024 * 16;
 const DEFAULT_AUDIO_HWM = 1024 * 1024 * 3;
-
-const BANDWIDTH_EMA_PREVIOUS_WEIGHT = 0.8;
-const BANDWIDTH_EMA_CURRENT_WEIGHT = 0.2;
-const MIN_FETCH_DURATION_FOR_BW_ESTIMATE_MS = 50;
 
 export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
   private readonly logger = Logger.getInstance();
@@ -92,6 +88,7 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
   private sabrContextUpdates = new Map<number, SabrContextUpdate>();
   private activeSabrContextTypes = new Set<number>();
   private trackCollection = new TrackCollection();
+  private bandwidth = new BandwidthEstimator();
 
   private videoId?: string;
   private broadcastId?: string;
@@ -106,7 +103,6 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
   private runtime = {
     playerTimeMs: 0,
     requestNumber: 0,
-    bandwidthEstimateBps: 0,
     lastHeartbeatTimeMs: 0,
     playbackSessionStartMs: undefined as number | undefined,
     poTokenGenerationId: 0,
@@ -119,7 +115,7 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
     busy: false
   };
 
-  private progressTracker = {
+  private health = {
     lastProgressTime: Date.now(),
     lastBufferedTimeMs: 0,
     stallCount: 0
@@ -199,7 +195,6 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
 
   public setStreamingURL(url: string | URL): void {
     this.serverAbrStreamingUrl = url instanceof URL ? url : new URL(url);
-    this.serverAbrStreamingUrl.searchParams.set('alr', 'no');
     this.validateStreamingUrl(this.serverAbrStreamingUrl);
   }
 
@@ -257,7 +252,7 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
     this.segmentBuffer.discardPending();
     this.runtime.playerTimeMs = Math.round(timeMs);
     this.lastSeekWallMs = Date.now();
-    this.resetProgressTracker(timeMs);
+    this.recordActivity(timeMs, true);
     this.warming = false;
 
     for (const output of previous) {
@@ -417,8 +412,9 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
         elapsedWallTimeMs: '0',
         timeSinceLastActionMs: '0',
         timeSinceLastSeek: '0',
-        playbackRate: 1,
-        visibility: 1,
+        visibility: 2 /* means fullscreen */,
+        enableSabrHostFallback: true,
+        supportsChangeType: false,
         enabledTrackTypesBitfield
       };
 
@@ -437,9 +433,7 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
         abrState.timeSinceLastSeek = this.lastSeekWallMs !== undefined ? String(Date.now() - this.lastSeekWallMs) : elapsedTimeMs;
         abrState.timeSinceLastActionMs = elapsedTimeMs;
         abrState.elapsedWallTimeMs = elapsedTimeMs;
-
-        if (this.runtime.bandwidthEstimateBps > 0)
-          abrState.bandwidthEstimate = Math.round(this.runtime.bandwidthEstimateBps).toString();
+        abrState.bandwidthEstimate = Math.round(this.bandwidth.get()).toString();
 
         this.logger.debug(TAG, `Starting new segment fetch, playerTimeMs=${abrState.playerTimeMs}, bandwidthEstimate=${abrState.bandwidthEstimate ?? 'n/a'}, elapsedWallTimeMs=${abrState.elapsedWallTimeMs}`);
 
@@ -551,7 +545,7 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
         if (!(response.displayEndscreen || response.offlineSlateButtonsPresent))
           return;
 
-        const elapsedTimeSinceLastProgress = Date.now() - this.progressTracker.lastProgressTime;
+        const elapsedTimeSinceLastProgress = Date.now() - this.health.lastProgressTime;
 
         if (elapsedTimeSinceLastProgress > OFFLINE_GRACE_PERIOD_MS) {
           this.logger.debug(TAG, `Heartbeat check indicates live stream is offline and no activity for ${elapsedTimeSinceLastProgress}ms. Stopping stream.`);
@@ -578,10 +572,11 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
     this.runtime.spsRejectCount = 0;
     this.runtime.playerTimeMs = 0;
     this.runtime.requestNumber = 0;
-    this.runtime.bandwidthEstimateBps = 0;
+    this.bandwidth.reset();
+
     this.isMintingPoToken = false;
 
-    this.resetProgressTracker(0);
+    this.recordActivity(0, true);
     this.clearRequestTimeout();
     this.setBusyState(false);
   }
@@ -598,19 +593,19 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
     const currentTime = Date.now();
     const stallThreshold = stallDetectionMs ?? DEFAULT_STALL_DETECTION_MS;
 
-    if (currentTime - this.progressTracker.lastProgressTime > stallThreshold) {
-      this.progressTracker.stallCount++;
+    if (currentTime - this.health.lastProgressTime > stallThreshold) {
+      this.health.stallCount++;
 
-      this.logger.warn(TAG, `Stream stalled for ${stallThreshold}ms (stall #${this.progressTracker.stallCount})`);
+      this.logger.warn(TAG, `Stream stalled for ${stallThreshold}ms (stall #${this.health.stallCount})`);
 
-      if (this.progressTracker.stallCount >= MAX_STALLS) {
+      if (this.health.stallCount >= MAX_STALLS) {
         if (this.isBroadcast) {
           this.logger.warn(TAG, 'Live stream stalled. Assuming end of stream and stopping download');
           this.shouldStop = true;
         } else throw new Error(`Stream stalled ${MAX_STALLS} times. Aborting`);
       }
 
-      this.progressTracker.lastProgressTime = currentTime;
+      this.health.lastProgressTime = currentTime;
     }
   }
 
@@ -706,12 +701,9 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
     assert(contentType === 'application/vnd.yt-ump', `Unexpected content type from server: ${contentType}`);
     assertIsDefined(response.body, 'Response body is null');
 
-    const startTime = performance.now();
-
     const reader = response.body.getReader();
 
     let serverSeek = false;
-    let bytesDownloaded = 0;
 
     //#region UMP Reader
     const umpReader = new UmpReader({
@@ -777,7 +769,7 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
           case UMPPartId.MEDIA_END: {
             const headerId = data.getUint8(0);
             if (this.segmentBuffer.finalizeSegment(headerId)) {
-              this.recordProgress(this.trackCollection.buffered);
+              this.recordActivity(this.trackCollection.buffered);
               this.logger.debug(TAG, `Finalized segment: headerId=${headerId}`);
               this.emit('trackStateUpdate', this.trackCollection);
             }
@@ -802,7 +794,7 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
             if (sabrSeek.seekSource === SeekSource.SABR_SEEK_TO_HEAD) {
               const seekTimeMs = ticksToMs(parseInt(sabrSeek.seekMediaTime || '0'), sabrSeek.seekMediaTimescale || 1000, Math.floor);
               this.seekTo(seekTimeMs, 'server');
-              this.resetProgressTracker(seekTimeMs);
+              this.recordActivity(seekTimeMs, true);
               this.ssapPlaybackInfos.clear();
               serverSeek = true;
             }
@@ -955,6 +947,8 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
 
     const abortController = this.abortController;
 
+    let isFirstChunk = true;
+
     try {
       while (true) {
         await this.waitForDrain();
@@ -969,13 +963,17 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
         if (this.lifecycle.aborted)
           break;
 
+        const readStart = performance.now();
         const { done, value } = await reader.read();
+        const readSec = (performance.now() - readStart) / 1000;
 
         if (done)
           break;
 
         if (value.length > 0) {
-          bytesDownloaded += value.length;
+          if (!isFirstChunk) // may include TTFB, so don't count it.
+            this.bandwidth.add(value.length, readSec);
+          isFirstChunk = false;
           this.resetRequestTimeout();
           await umpReader.feed(value);
         }
@@ -987,21 +985,9 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
       umpReader.dispose();
     }
 
-    const fetchDurationMs = performance.now() - startTime;
-
-    if (fetchDurationMs > MIN_FETCH_DURATION_FOR_BW_ESTIMATE_MS && bytesDownloaded > 0) {
-      const currentBps = (bytesDownloaded * 8) / (fetchDurationMs / 1000);
-      const bandwidthEstimateBps = this.runtime.bandwidthEstimateBps;
-      this.runtime.bandwidthEstimateBps = bandwidthEstimateBps === 0
-        ? currentBps
-        : BANDWIDTH_EMA_PREVIOUS_WEIGHT * bandwidthEstimateBps + BANDWIDTH_EMA_CURRENT_WEIGHT * currentBps;
-    }
-
     if (!serverSeek && this.seekEpoch === epoch) {
       const buffered = this.trackCollection.buffered;
-      if (buffered !== Infinity) {
-        this.seekTo(buffered, 'client');
-      }
+      if (buffered !== Infinity) this.seekTo(buffered, 'client');
     }
   }
 
@@ -1032,7 +1018,7 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
     const ssapPlaybackInfos = Array.from(this.ssapPlaybackInfos.values());
     const videoPlaybackUstreamerConfig = base64ToU8(this.videoPlaybackUstreamerConfig);
     const bufferedRanges = this.trackCollection.bufferedRanges;
-    const playbackCookie = this.nextRequestPolicy?.playbackCookie ? PlaybackCookie.encode(this.nextRequestPolicy.playbackCookie).finish() : undefined;
+    const playbackCookie = this.nextRequestPolicy?.playbackCookie;
     const clientInfo = this.clientInfo;
     const poToken = this.proofOfOriginToken;
 
@@ -1090,7 +1076,6 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
           'accept-encoding': 'identity',
           'accept': 'application/vnd.yt-ump'
         },
-        redirect: 'follow',
         signal: this.abortController.signal
       });
     } catch (error) {
@@ -1150,26 +1135,18 @@ export class SabrStream extends EventEmitterLike<SabrStreamEvents> {
     }
   }
 
-  private recordProgress(progressMs: number): void {
-    if (!Number.isFinite(progressMs) || progressMs <= this.progressTracker.lastBufferedTimeMs)
+  private recordActivity(progressMs: number, reset = false): void {
+    if (!reset && (!Number.isFinite(progressMs) || progressMs <= this.health.lastBufferedTimeMs))
       return;
 
-    this.progressTracker.lastProgressTime = Date.now();
-    this.progressTracker.lastBufferedTimeMs = progressMs;
-    this.progressTracker.stallCount = 0;
+    this.health.lastProgressTime = Date.now();
+    this.health.lastBufferedTimeMs = progressMs;
+    this.health.stallCount = 0;
   }
 
   private seekTo(timeMs: number, source: 'server' | 'client'): void {
     this.logger.debug(TAG, `Seeking: timeMs=${timeMs}, source=${source}`);
     this.runtime.playerTimeMs = Math.round(timeMs);
-  }
-
-  private resetProgressTracker(progressMs: number): void {
-    this.progressTracker = {
-      lastProgressTime: Date.now(),
-      lastBufferedTimeMs: progressMs,
-      stallCount: 0
-    };
   }
 
   //#endregion
