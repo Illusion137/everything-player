@@ -174,9 +174,9 @@ public object NextRequestPolicyKt {
     }
 
     /**
-     * `optional .video_streaming.PlaybackCookie playback_cookie = 7;`
+     * `optional bytes playback_cookie = 7;`
      */
-    public var playbackCookie: com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming.PlaybackCookie
+    public var playbackCookie: com.google.protobuf.ByteString
       @kotlin.jvm.JvmName("getPlaybackCookie")
         get() = _builder.playbackCookie
       @kotlin.jvm.JvmName("setPlaybackCookie")
@@ -184,21 +184,18 @@ public object NextRequestPolicyKt {
         _builder.playbackCookie = value
       }
     /**
-     * `optional .video_streaming.PlaybackCookie playback_cookie = 7;`
+     * `optional bytes playback_cookie = 7;`
      */
     public fun clearPlaybackCookie() {
       _builder.clearPlaybackCookie()
     }
     /**
-     * `optional .video_streaming.PlaybackCookie playback_cookie = 7;`
+     * `optional bytes playback_cookie = 7;`
      * @return Whether the playbackCookie field is set.
      */
     public fun hasPlaybackCookie(): kotlin.Boolean {
       return _builder.hasPlaybackCookie()
     }
-
-    public val NextRequestPolicyKt.Dsl.playbackCookieOrNull: com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming.PlaybackCookie?
-      get() = _builder.playbackCookieOrNull
 
     /**
      * `optional string video_id = 8;`
@@ -223,11 +220,32 @@ public object NextRequestPolicyKt {
     public fun hasVideoId(): kotlin.Boolean {
       return _builder.hasVideoId()
     }
+
+    /**
+     * `optional bool send_initial_sabr_request = 9;`
+     */
+    public var sendInitialSabrRequest: kotlin.Boolean
+      @kotlin.jvm.JvmName("getSendInitialSabrRequest")
+        get() = _builder.sendInitialSabrRequest
+      @kotlin.jvm.JvmName("setSendInitialSabrRequest")
+        set(value) {
+        _builder.sendInitialSabrRequest = value
+      }
+    /**
+     * `optional bool send_initial_sabr_request = 9;`
+     */
+    public fun clearSendInitialSabrRequest() {
+      _builder.clearSendInitialSabrRequest()
+    }
+    /**
+     * `optional bool send_initial_sabr_request = 9;`
+     * @return Whether the sendInitialSabrRequest field is set.
+     */
+    public fun hasSendInitialSabrRequest(): kotlin.Boolean {
+      return _builder.hasSendInitialSabrRequest()
+    }
   }
 }
 public inline fun com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming.NextRequestPolicy.copy(block: `com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming`.NextRequestPolicyKt.Dsl.() -> kotlin.Unit): com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming.NextRequestPolicy =
   `com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming`.NextRequestPolicyKt.Dsl._create(this.toBuilder()).apply { block() }._build()
-
-public val com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming.NextRequestPolicyOrBuilder.playbackCookieOrNull: com.margelo.nitro.everythingplayer.googlevideo.protos.video_streaming.PlaybackCookie?
-  get() = if (hasPlaybackCookie()) getPlaybackCookie() else null
 

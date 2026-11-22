@@ -8,6 +8,7 @@
 // For information on using the generated types, please see the documentation:
 //   https://github.com/apple/swift-protobuf/
 
+import Foundation
 import SwiftProtobuf
 
 // If the compiler emits an error on this type, it is because this file
@@ -79,8 +80,8 @@ struct VideoStreaming_NextRequestPolicy: Sendable {
   /// Clears the value of `minVideoReadaheadMs`. Subsequent reads from it will return its default value.
   mutating func clearMinVideoReadaheadMs() {self._minVideoReadaheadMs = nil}
 
-  var playbackCookie: VideoStreaming_PlaybackCookie {
-    get {_playbackCookie ?? VideoStreaming_PlaybackCookie()}
+  var playbackCookie: Data {
+    get {_playbackCookie ?? Data()}
     set {_playbackCookie = newValue}
   }
   /// Returns true if `playbackCookie` has been explicitly set.
@@ -97,6 +98,15 @@ struct VideoStreaming_NextRequestPolicy: Sendable {
   /// Clears the value of `videoID`. Subsequent reads from it will return its default value.
   mutating func clearVideoID() {self._videoID = nil}
 
+  var sendInitialSabrRequest: Bool {
+    get {_sendInitialSabrRequest ?? false}
+    set {_sendInitialSabrRequest = newValue}
+  }
+  /// Returns true if `sendInitialSabrRequest` has been explicitly set.
+  var hasSendInitialSabrRequest: Bool {self._sendInitialSabrRequest != nil}
+  /// Clears the value of `sendInitialSabrRequest`. Subsequent reads from it will return its default value.
+  mutating func clearSendInitialSabrRequest() {self._sendInitialSabrRequest = nil}
+
   var unknownFields = SwiftProtobuf.UnknownStorage()
 
   init() {}
@@ -107,8 +117,9 @@ struct VideoStreaming_NextRequestPolicy: Sendable {
   fileprivate var _backoffTimeMs: Int32? = nil
   fileprivate var _minAudioReadaheadMs: Int32? = nil
   fileprivate var _minVideoReadaheadMs: Int32? = nil
-  fileprivate var _playbackCookie: VideoStreaming_PlaybackCookie? = nil
+  fileprivate var _playbackCookie: Data? = nil
   fileprivate var _videoID: String? = nil
+  fileprivate var _sendInitialSabrRequest: Bool? = nil
 }
 
 // MARK: - Code below here is support for the SwiftProtobuf runtime.
@@ -117,7 +128,7 @@ fileprivate let _protobuf_package = "video_streaming"
 
 extension VideoStreaming_NextRequestPolicy: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   static let protoMessageName: String = _protobuf_package + ".NextRequestPolicy"
-  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}target_audio_readahead_ms\0\u{3}target_video_readahead_ms\0\u{3}max_time_since_last_request_ms\0\u{3}backoff_time_ms\0\u{3}min_audio_readahead_ms\0\u{3}min_video_readahead_ms\0\u{3}playback_cookie\0\u{3}video_id\0")
+  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}target_audio_readahead_ms\0\u{3}target_video_readahead_ms\0\u{3}max_time_since_last_request_ms\0\u{3}backoff_time_ms\0\u{3}min_audio_readahead_ms\0\u{3}min_video_readahead_ms\0\u{3}playback_cookie\0\u{3}video_id\0\u{3}send_initial_sabr_request\0")
 
   mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -131,8 +142,9 @@ extension VideoStreaming_NextRequestPolicy: SwiftProtobuf.Message, SwiftProtobuf
       case 4: try { try decoder.decodeSingularInt32Field(value: &self._backoffTimeMs) }()
       case 5: try { try decoder.decodeSingularInt32Field(value: &self._minAudioReadaheadMs) }()
       case 6: try { try decoder.decodeSingularInt32Field(value: &self._minVideoReadaheadMs) }()
-      case 7: try { try decoder.decodeSingularMessageField(value: &self._playbackCookie) }()
+      case 7: try { try decoder.decodeSingularBytesField(value: &self._playbackCookie) }()
       case 8: try { try decoder.decodeSingularStringField(value: &self._videoID) }()
+      case 9: try { try decoder.decodeSingularBoolField(value: &self._sendInitialSabrRequest) }()
       default: break
       }
     }
@@ -162,10 +174,13 @@ extension VideoStreaming_NextRequestPolicy: SwiftProtobuf.Message, SwiftProtobuf
       try visitor.visitSingularInt32Field(value: v, fieldNumber: 6)
     } }()
     try { if let v = self._playbackCookie {
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 7)
+      try visitor.visitSingularBytesField(value: v, fieldNumber: 7)
     } }()
     try { if let v = self._videoID {
       try visitor.visitSingularStringField(value: v, fieldNumber: 8)
+    } }()
+    try { if let v = self._sendInitialSabrRequest {
+      try visitor.visitSingularBoolField(value: v, fieldNumber: 9)
     } }()
     try unknownFields.traverse(visitor: &visitor)
   }
@@ -179,6 +194,7 @@ extension VideoStreaming_NextRequestPolicy: SwiftProtobuf.Message, SwiftProtobuf
     if lhs._minVideoReadaheadMs != rhs._minVideoReadaheadMs {return false}
     if lhs._playbackCookie != rhs._playbackCookie {return false}
     if lhs._videoID != rhs._videoID {return false}
+    if lhs._sendInitialSabrRequest != rhs._sendInitialSabrRequest {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

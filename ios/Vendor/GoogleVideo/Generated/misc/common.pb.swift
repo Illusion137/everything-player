@@ -403,6 +403,18 @@ struct Misc_KeyValuePair: Sendable {
   fileprivate var _value: String? = nil
 }
 
+struct Misc_FormatXTags: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  var xtags: [Misc_KeyValuePair] = []
+
+  var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  init() {}
+}
+
 struct Misc_AuthorizedFormat: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -694,6 +706,36 @@ extension Misc_KeyValuePair: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
   static func ==(lhs: Misc_KeyValuePair, rhs: Misc_KeyValuePair) -> Bool {
     if lhs._key != rhs._key {return false}
     if lhs._value != rhs._value {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+extension Misc_FormatXTags: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  static let protoMessageName: String = _protobuf_package + ".FormatXTags"
+  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}xtags\0")
+
+  mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeRepeatedMessageField(value: &self.xtags) }()
+      default: break
+      }
+    }
+  }
+
+  func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.xtags.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.xtags, fieldNumber: 1)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  static func ==(lhs: Misc_FormatXTags, rhs: Misc_FormatXTags) -> Bool {
+    if lhs.xtags != rhs.xtags {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
