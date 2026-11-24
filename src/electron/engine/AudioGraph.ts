@@ -5,6 +5,13 @@ import {
 } from '../../types/enums'
 
 const EQ_Q = 1.41
+const BASS_FREQUENCY = 180
+const BASS_CUT_GAIN = -24
+
+export interface ElementChain {
+  gain: GainNode
+  shelf: BiquadFilterNode
+}
 
 export class AudioGraph {
   private context: AudioContext | undefined
@@ -33,13 +40,29 @@ export class AudioGraph {
     return context
   }
 
-  connect(element: HTMLMediaElement): GainNode {
+  connect(element: HTMLMediaElement, sink: (input: AudioBuffer) => void): ElementChain {
     const context = this.ensure()
     const source = context.createMediaElementSource(element)
+    const shelf = context.createBiquadFilter()
+    shelf.type = 'lowshelf'
+    shelf.frequency.value = BASS_FREQUENCY
+    shelf.gain.value = 0
     const gain = context.createGain()
-    source.connect(gain)
+    source.connect(shelf)
+    shelf.connect(gain)
     gain.connect(this.input!)
-    return gain
+    const tap = context.createScriptProcessor(2048, 2, 1)
+    const mute = context.createGain()
+    mute.gain.value = 0
+    tap.onaudioprocess = (e) => sink(e.inputBuffer)
+    source.connect(tap)
+    tap.connect(mute)
+    mute.connect(context.destination)
+    return { gain, shelf }
+  }
+
+  setBassCut(shelf: BiquadFilterNode, amount: number): void {
+    shelf.gain.value = BASS_CUT_GAIN * Math.min(1, Math.max(0, amount))
   }
 
   resume(): void {

@@ -48,6 +48,7 @@ let currentUpdateOptions: NativeUpdateOptions = {
   progressUpdateEventInterval: 0,
   forwardJumpInterval: 15,
   backwardJumpInterval: 15,
+  djCrossfade: false,
 }
 
 const emitter = new Emitter<EventPayloadByEvent>(bindNative)
@@ -214,6 +215,7 @@ export function updateOptions(options: UpdateOptions = {}): Promise<void> {
       options.forwardJumpInterval ?? currentUpdateOptions.forwardJumpInterval,
     backwardJumpInterval:
       options.backwardJumpInterval ?? currentUpdateOptions.backwardJumpInterval,
+    djCrossfade: options.djCrossfade ?? currentUpdateOptions.djCrossfade,
     appKilledPlaybackBehavior:
       options.android?.appKilledPlaybackBehavior ??
       currentUpdateOptions.appKilledPlaybackBehavior,

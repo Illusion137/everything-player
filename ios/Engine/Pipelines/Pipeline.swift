@@ -28,6 +28,7 @@ protocol EPPipeline: AnyObject {
   var rate: Float { get set }
   var level: Float? { get }
   var bassCut: Float { get set }
+  var beats: EPBeatAnalyzer? { get }
   var videoSource: EPVideoFrameSource? { get }
   var videoQuality: EPVideoQualityState { get }
 

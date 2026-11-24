@@ -122,13 +122,9 @@ struct EPTrack: Codable {
   var trimStart: Double { max(0, startTime ?? 0) }
 
   func trimEnd(mediaDuration: Double?) -> Double? {
-    let known = duration ?? mediaDuration
-    switch (endTime, known) {
-    case let (e?, d?): return min(e, d)
-    case let (e?, nil): return e
-    case let (nil, d?): return d
-    default: return nil
-    }
+    guard let endTime else { return duration ?? mediaDuration }
+    guard let mediaDuration, mediaDuration > trimStart else { return endTime }
+    return min(endTime, mediaDuration)
   }
 }
 
@@ -197,6 +193,7 @@ struct EPUpdateOptions {
   var progressUpdateEventInterval: Double = 0
   var forwardJumpInterval: Double = 15
   var backwardJumpInterval: Double = 15
+  var djCrossfade = false
 }
 
 struct EPProgress {
@@ -221,6 +218,16 @@ enum EPEqualizer {
   static let frequencies: [Float] = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
   static let minGain: Float = -12
   static let maxGain: Float = 12
+}
+
+enum EPMix {
+  static let prepare: Double = 45
+  static let planLead: Double = 10
+  static let cue: Double = 16
+  static let minConfidence: Double = 0.15
+  static let maxStretch: Double = 0.08
+  static let gain: Double = 2
+  static let glideSeconds: Double = 12
 }
 
 enum EPBlend {

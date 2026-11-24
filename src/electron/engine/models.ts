@@ -81,11 +81,9 @@ export function trimEnd(
   track: NativeTrack,
   mediaDuration: number | undefined
 ): number | undefined {
-  const known = track.duration ?? mediaDuration
-  if (track.endTime !== undefined && known !== undefined) {
-    return Math.min(track.endTime, known)
-  }
-  return track.endTime ?? known
+  if (track.endTime === undefined) return track.duration ?? mediaDuration
+  if (mediaDuration === undefined || mediaDuration <= trimStart(track)) return track.endTime
+  return Math.min(track.endTime, mediaDuration)
 }
 
 export function inRange(
@@ -164,6 +162,7 @@ export const DEFAULT_UPDATE: NativeUpdateOptions = {
   progressUpdateEventInterval: 0,
   forwardJumpInterval: 15,
   backwardJumpInterval: 15,
+  djCrossfade: false,
 }
 
 export function withTimeout<T>(

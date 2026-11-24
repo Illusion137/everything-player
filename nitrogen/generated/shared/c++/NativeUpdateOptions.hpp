@@ -49,11 +49,12 @@ namespace margelo::nitro::everythingplayer {
     double progressUpdateEventInterval     SWIFT_PRIVATE;
     double forwardJumpInterval     SWIFT_PRIVATE;
     double backwardJumpInterval     SWIFT_PRIVATE;
+    bool djCrossfade     SWIFT_PRIVATE;
     std::optional<NativeAppKilledPlaybackBehavior> appKilledPlaybackBehavior     SWIFT_PRIVATE;
 
   public:
     NativeUpdateOptions() = default;
-    explicit NativeUpdateOptions(std::vector<NativeCapability> capabilities, double progressUpdateEventInterval, double forwardJumpInterval, double backwardJumpInterval, std::optional<NativeAppKilledPlaybackBehavior> appKilledPlaybackBehavior): capabilities(capabilities), progressUpdateEventInterval(progressUpdateEventInterval), forwardJumpInterval(forwardJumpInterval), backwardJumpInterval(backwardJumpInterval), appKilledPlaybackBehavior(appKilledPlaybackBehavior) {}
+    explicit NativeUpdateOptions(std::vector<NativeCapability> capabilities, double progressUpdateEventInterval, double forwardJumpInterval, double backwardJumpInterval, bool djCrossfade, std::optional<NativeAppKilledPlaybackBehavior> appKilledPlaybackBehavior): capabilities(capabilities), progressUpdateEventInterval(progressUpdateEventInterval), forwardJumpInterval(forwardJumpInterval), backwardJumpInterval(backwardJumpInterval), djCrossfade(djCrossfade), appKilledPlaybackBehavior(appKilledPlaybackBehavior) {}
 
   public:
     friend bool operator==(const NativeUpdateOptions& lhs, const NativeUpdateOptions& rhs) = default;
@@ -73,6 +74,7 @@ namespace margelo::nitro {
         JSIConverter<double>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "progressUpdateEventInterval"))),
         JSIConverter<double>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "forwardJumpInterval"))),
         JSIConverter<double>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "backwardJumpInterval"))),
+        JSIConverter<bool>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "djCrossfade"))),
         JSIConverter<std::optional<margelo::nitro::everythingplayer::NativeAppKilledPlaybackBehavior>>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "appKilledPlaybackBehavior")))
       );
     }
@@ -82,6 +84,7 @@ namespace margelo::nitro {
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "progressUpdateEventInterval"), JSIConverter<double>::toJSI(runtime, arg.progressUpdateEventInterval));
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "forwardJumpInterval"), JSIConverter<double>::toJSI(runtime, arg.forwardJumpInterval));
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "backwardJumpInterval"), JSIConverter<double>::toJSI(runtime, arg.backwardJumpInterval));
+      obj.setProperty(runtime, PropNameIDCache::get(runtime, "djCrossfade"), JSIConverter<bool>::toJSI(runtime, arg.djCrossfade));
       obj.setProperty(runtime, PropNameIDCache::get(runtime, "appKilledPlaybackBehavior"), JSIConverter<std::optional<margelo::nitro::everythingplayer::NativeAppKilledPlaybackBehavior>>::toJSI(runtime, arg.appKilledPlaybackBehavior));
       return obj;
     }
@@ -97,6 +100,7 @@ namespace margelo::nitro {
       if (!JSIConverter<double>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "progressUpdateEventInterval")))) return false;
       if (!JSIConverter<double>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "forwardJumpInterval")))) return false;
       if (!JSIConverter<double>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "backwardJumpInterval")))) return false;
+      if (!JSIConverter<bool>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "djCrossfade")))) return false;
       if (!JSIConverter<std::optional<margelo::nitro::everythingplayer::NativeAppKilledPlaybackBehavior>>::canConvert(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "appKilledPlaybackBehavior")))) return false;
       return true;
     }

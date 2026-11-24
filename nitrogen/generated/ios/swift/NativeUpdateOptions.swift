@@ -18,14 +18,14 @@ public extension NativeUpdateOptions {
   /**
    * Create a new instance of `NativeUpdateOptions`.
    */
-  init(capabilities: [NativeCapability], progressUpdateEventInterval: Double, forwardJumpInterval: Double, backwardJumpInterval: Double, appKilledPlaybackBehavior: NativeAppKilledPlaybackBehavior?) {
+  init(capabilities: [NativeCapability], progressUpdateEventInterval: Double, forwardJumpInterval: Double, backwardJumpInterval: Double, djCrossfade: Bool, appKilledPlaybackBehavior: NativeAppKilledPlaybackBehavior?) {
     self.init({ () -> bridge.std__vector_NativeCapability_ in
       var __vector = bridge.create_std__vector_NativeCapability_(capabilities.count)
       for __item in capabilities {
         __vector.push_back(__item)
       }
       return __vector
-    }(), progressUpdateEventInterval, forwardJumpInterval, backwardJumpInterval, { () -> bridge.std__optional_NativeAppKilledPlaybackBehavior_ in
+    }(), progressUpdateEventInterval, forwardJumpInterval, backwardJumpInterval, djCrossfade, { () -> bridge.std__optional_NativeAppKilledPlaybackBehavior_ in
       if let __unwrappedValue = appKilledPlaybackBehavior {
         return bridge.create_std__optional_NativeAppKilledPlaybackBehavior_(__unwrappedValue)
       } else {
@@ -52,6 +52,11 @@ public extension NativeUpdateOptions {
   @inline(__always)
   var backwardJumpInterval: Double {
     return self.__backwardJumpInterval
+  }
+  
+  @inline(__always)
+  var djCrossfade: Bool {
+    return self.__djCrossfade
   }
   
   @inline(__always)

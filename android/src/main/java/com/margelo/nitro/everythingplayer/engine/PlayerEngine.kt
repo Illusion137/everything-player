@@ -16,8 +16,42 @@ import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaSession
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.ln
+import kotlin.math.roundToLong
 import kotlin.math.sin
+
+private object EPMix {
+  const val PREPARE = 45.0
+  const val PLAN_LEAD = 10.0
+  const val CUE = 16.0
+  const val MIN_CONFIDENCE = 0.15
+  const val MAX_STRETCH = 0.08
+  const val GAIN = 2.0
+  const val GLIDE_SECONDS = 12.0
+}
+
+private class EPMixPlan(
+  val outGrid: EPBeatGrid,
+  val inPeriod: Double,
+  val mixStart: Double,
+  val inStart: Double,
+  val beats: Double,
+  val swapBeat: Double,
+  val ratio: Double,
+) {
+  var started = false
+  var lastRate = 0f
+  var frames = 0
+}
+
+private class EPRateGlide(val from: Float, val start: Double)
+
+private fun epEase(p: Double): Double {
+  val x = p.coerceIn(0.0, 1.0)
+  return x * x * (3 - 2 * x)
+}
 
 @OptIn(UnstableApi::class)
 object EPPlayerEngine : EPPipelineDelegate {
@@ -65,6 +99,10 @@ object EPPlayerEngine : EPPipelineDelegate {
   private var fading = false
   private var fadeStart: Double? = null
   private var fadeDuration = 0.0
+  private var mixPlan: EPMixPlan? = null
+  private var cueing = false
+  private var djFailed = false
+  private var rateGlide: EPRateGlide? = null
   private var resumeAfterFocusGain = false
   @Volatile private var snapshot = EPProgress(0.0, 0.0, 0.0)
 
@@ -82,7 +120,7 @@ object EPPlayerEngine : EPPipelineDelegate {
   private val fadeTick = object : Runnable {
     override fun run() {
       if (!fading) return
-      stepFade()
+      if (mixPlan != null) stepMix() else stepFade()
       main.postDelayed(this, FADE_FRAME_MS)
     }
   }
@@ -195,6 +233,7 @@ object EPPlayerEngine : EPPipelineDelegate {
   fun setRate(value: Float) {
     locked { rate = value }
     onMain {
+      rateGlide = null
       primary?.rate = value
       secondary?.rate = value
     }
@@ -380,7 +419,7 @@ object EPPlayerEngine : EPPipelineDelegate {
         return@onMain
       }
       p.play()
-      if (fading) secondary?.play()
+      if (fading && mixPlan?.started != false) secondary?.play()
       syncState()
     }
   }
@@ -439,6 +478,10 @@ object EPPlayerEngine : EPPipelineDelegate {
     onProgress?.invoke(getProgress(), getActiveIndex(), currentTrackId())
     onMain {
       cancelFade()
+      if (rateGlide != null) {
+        rateGlide = null
+        primary?.rate = locked { rate }
+      }
       val p = primary
       if (p != null && getState() != EPState.ENDED) p.seek(target) else loadActive(target)
     }
@@ -495,6 +538,7 @@ object EPPlayerEngine : EPPipelineDelegate {
     activePipeline = null
     secondary = null
     endFade()
+    rateGlide = null
     p?.delegate = null
     s?.delegate = null
     p?.teardown()
@@ -519,6 +563,7 @@ object EPPlayerEngine : EPPipelineDelegate {
 
   private fun promoteSecondary(lastIndex: Int?, lastId: String?, lastPosition: Double, newIndex: Int) {
     val next = secondary ?: return
+    val glideFrom = if (mixPlan != null) next.rate else null
     val old = primary
     primary = next
     activePipeline = next
@@ -531,6 +576,8 @@ object EPPlayerEngine : EPPipelineDelegate {
     old?.delegate = null
     old?.teardown()
     next.volume = locked { volume }
+    next.bassCut = 0f
+    rateGlide = if (glideFrom != null && glideFrom != locked { rate }) EPRateGlide(glideFrom, next.currentTime) else null
     next.attachVideo()
     if (isPlayWhenReady()) next.play()
     emitActiveChange(lastIndex, lastId, lastPosition)
@@ -548,11 +595,13 @@ object EPPlayerEngine : EPPipelineDelegate {
     s?.delegate = null
     s?.teardown()
     primary?.volume = locked { volume }
+    primary?.bassCut = 0f
   }
 
   private fun endFade() {
     fading = false
     fadeStart = null
+    mixPlan = null
     main.removeCallbacks(fadeTick)
   }
 
@@ -683,6 +732,7 @@ object EPPlayerEngine : EPPipelineDelegate {
     val p = primary ?: return
     if (!::appContext.isInitialized) return
     if (!isPlayWhenReady()) return
+    applyRateGlide(p)
     val track = p.track
     val fadeLength = locked { crossfadeSeconds }
     val mode = getRepeatMode()
@@ -691,17 +741,25 @@ object EPPlayerEngine : EPPipelineDelegate {
     val remaining = end - p.currentTime
     val nextIdx = locked { nextIndex(false) }
     val canFade = fadeLength > 0 && mode != EPRepeatMode.TRACK && (end - track.trimStart) >= 2 * fadeLength
+    val dj = canFade && updateOptions.djCrossfade
+    val lookahead = fadeLength + if (dj) EPMix.PREPARE else 0.0
 
-    if (secondary == null && nextIdx != null && mode != EPRepeatMode.TRACK && remaining <= fadeLength + 8 && remaining > 0.25) {
+    if (secondary == null && nextIdx != null && mode != EPRepeatMode.TRACK && remaining <= lookahead + 8 && remaining > 0.25) {
       val nextTrack = locked { queue[nextIdx] }
       val pipeline = makePipeline(nextTrack)
       pipeline.volume = if (canFade) 0f else vol
       secondary = pipeline
+      cueing = false
+      djFailed = false
       pipeline.load(nextTrack.trimStart)
     }
 
     val s = secondary ?: return
     if (!canFade || getState() != EPState.PLAYING) return
+    if (dj && !djFailed) {
+      if (!fading) prepareMix(p, s, end, remaining, fadeLength)
+      return
+    }
     if (fading || remaining > fadeLength) return
     if (s.status != EPPipelineStatus.Ready && s.status != EPPipelineStatus.Playing) return
     fading = true
@@ -725,6 +783,134 @@ object EPPlayerEngine : EPPipelineDelegate {
     p.volume = vol * cos(eased * PI / 2).toFloat()
     s.volume = vol * sin(eased * PI / 2).toFloat()
     if (progress >= 1 || end - position <= 0.05) finishFade()
+  }
+
+  private fun prepareMix(p: EPPipeline, s: EPPipeline, end: Double, remaining: Double, fadeLength: Double) {
+    when (s.status) {
+      EPPipelineStatus.Ready, EPPipelineStatus.Playing, EPPipelineStatus.Buffering -> {}
+      is EPPipelineStatus.Failed -> return
+      else -> {
+        if (remaining <= fadeLength + 1) failMix(s)
+        return
+      }
+    }
+    val outBeats = p.beats ?: return failMix(s)
+    val inBeats = s.beats ?: return failMix(s)
+    val inFrom = s.track.trimStart
+    val inTo = minOf(inFrom + EPMix.CUE, s.track.trimEnd(s.mediaDuration) ?: Double.POSITIVE_INFINITY)
+    if (!inBeats.covered(inFrom, inTo)) {
+      if (remaining <= fadeLength + 1) return failMix(s)
+      if (!cueing || s.status == EPPipelineStatus.Ready) {
+        cueing = true
+        s.volume = 0f
+        s.play()
+      }
+      return
+    }
+    if (cueing) {
+      cueing = false
+      s.pause()
+    }
+    if (remaining > fadeLength + EPMix.PLAN_LEAD) return
+
+    val position = p.currentTime
+    val userRate = locked { rate }.toDouble()
+    val outGrid = outBeats.grid(maxOf(p.track.trimStart, position - 30), end)
+    val inGrid = inBeats.grid(inFrom, inTo)
+    if (outGrid == null || inGrid == null || outGrid.confidence < EPMix.MIN_CONFIDENCE || inGrid.confidence < EPMix.MIN_CONFIDENCE) {
+      return failMix(s)
+    }
+    var match: Pair<Double, Double>? = null
+    for (multiple in doubleArrayOf(1.0, 2.0, 0.5)) {
+      val period = inGrid.period * multiple
+      val ratio = period / outGrid.period
+      if (abs(ln(ratio)) > ln(1 + EPMix.MAX_STRETCH)) continue
+      if (match == null || abs(ln(ratio)) < abs(ln(match.first))) match = ratio to period
+    }
+    if (match == null) return failMix(s)
+
+    var beats = maxOf(8.0, (fadeLength * userRate / outGrid.period / 4).roundToLong() * 4.0)
+    val earliest = position + 2 * outGrid.period
+    var mixStart = outGrid.downbeatAtOrBefore(end - beats * outGrid.period)
+    while (mixStart < earliest && beats > 8) {
+      beats -= 4
+      mixStart = outGrid.downbeatAtOrBefore(end - beats * outGrid.period)
+    }
+    val inStart = inGrid.downbeatAtOrAfter(inFrom)
+    if (mixStart < earliest || inStart >= inTo) return failMix(s)
+
+    mixPlan = EPMixPlan(outGrid, match.second, mixStart, inStart, beats, maxOf(4.0, kotlin.math.floor(beats / 8) * 4), match.first)
+    fading = true
+    s.volume = 0f
+    s.bassCut = 1f
+    s.rate = (userRate * match.first).toFloat()
+    s.seek(inStart)
+    main.removeCallbacks(fadeTick)
+    main.post(fadeTick)
+  }
+
+  private fun failMix(s: EPPipeline) {
+    djFailed = true
+    if (cueing) {
+      cueing = false
+      s.pause()
+    }
+    s.volume = 0f
+    s.rate = locked { rate }
+    if (abs(s.currentTime - s.track.trimStart) > 0.05) s.seek(s.track.trimStart)
+  }
+
+  private fun stepMix() {
+    val p = primary ?: return
+    val s = secondary ?: return
+    val plan = mixPlan ?: return
+    if (!isPlayWhenReady()) return
+    val userRate = locked { rate }.toDouble()
+    val vol = getVolume()
+    val outBeat = (p.currentTime - plan.mixStart) / plan.outGrid.period
+    if (!plan.started) {
+      if (s.status != EPPipelineStatus.Ready && s.status != EPPipelineStatus.Playing) {
+        if (outBeat > 1) {
+          endFade()
+          failMix(s)
+        }
+        return
+      }
+      if (outBeat < -(FADE_FRAME_MS / 1000.0) * userRate / plan.outGrid.period) return
+      plan.started = true
+      plan.lastRate = s.rate
+      s.play()
+      return
+    }
+
+    plan.frames++
+    if (s.status == EPPipelineStatus.Playing && plan.frames % 6 == 0) {
+      var error = (s.currentTime - plan.inStart) / plan.inPeriod - outBeat
+      error -= Math.rint(error)
+      val seconds = error * plan.outGrid.period / userRate
+      val limit = if (abs(seconds) > 0.05) 0.06 else 0.02
+      val target = (userRate * plan.ratio * (1 + (-seconds * EPMix.GAIN).coerceIn(-limit, limit))).toFloat()
+      if (abs(target - plan.lastRate) > 0.0005f) {
+        s.rate = target
+        plan.lastRate = target
+      }
+    }
+
+    val progress = (outBeat / plan.beats).coerceIn(0.0, 1.0)
+    val swap = ((outBeat - plan.swapBeat) / 0.25 + 1).coerceIn(0.0, 1.0).toFloat()
+    p.volume = vol * (1 - epEase(progress * 2 - 1)).toFloat()
+    s.volume = vol * epEase(progress * 2).toFloat()
+    p.bassCut = swap
+    s.bassCut = 1 - swap
+    if (progress >= 1) finishFade()
+  }
+
+  private fun applyRateGlide(p: EPPipeline) {
+    val glide = rateGlide ?: return
+    val user = locked { rate }
+    val progress = ((p.currentTime - glide.start) / EPMix.GLIDE_SECONDS).coerceIn(0.0, 1.0)
+    p.rate = glide.from + (user - glide.from) * epEase(progress).toFloat()
+    if (progress >= 1) rateGlide = null
   }
 
   private fun warmUpcomingSabr() {

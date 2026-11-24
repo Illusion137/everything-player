@@ -34,7 +34,8 @@ final class HybridEverythingPlayer: HybridEverythingPlayerSpec {
       capabilities: options.capabilities.map(\.stringValue),
       progressUpdateEventInterval: options.progressUpdateEventInterval,
       forwardJumpInterval: options.forwardJumpInterval,
-      backwardJumpInterval: options.backwardJumpInterval))
+      backwardJumpInterval: options.backwardJumpInterval,
+      djCrossfade: options.djCrossfade))
     return Promise.resolved()
   }
 

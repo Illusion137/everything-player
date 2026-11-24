@@ -50,6 +50,7 @@ export interface UpdateOptions {
   progressUpdateEventInterval?: number
   forwardJumpInterval?: number
   backwardJumpInterval?: number
+  djCrossfade?: boolean
   android?: {
     appKilledPlaybackBehavior?: AppKilledPlaybackBehavior
   }

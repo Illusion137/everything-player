@@ -227,6 +227,13 @@ Rules carried over from the reference implementation:
 - Crossfade begins at `endTime - crossFade` (or the track's end if no `endTime`).
 - Crossfade is skipped for tracks shorter than twice the fade length, for `RepeatMode.Track`, and cancelled by a manual skip.
 
+### DJ crossfade
+`updateOptions({ djCrossfade: true })` (default `false`) turns the crossfade into a beat-matched mix. `setCrossFade(seconds)` still sets the target length (it must be > 0).
+- Both tracks are beat-tracked on device (onset envelope → tempo → beat and bar phase). The incoming track's intro is analysed ahead of time: from the decode-ahead buffer for SABR/HLS, otherwise by cueing it muted for ~16 s.
+- The incoming track is time-stretched (pitch preserved, up to ±8 %, with half/double-tempo matching) to the outgoing tempo and dropped on a downbeat aligned to the outgoing bar grid. The mix length is rounded to whole bars and ends on or before `endTime`.
+- During the mix the beats stay phase-locked with small rate nudges. The bass swaps on a bar boundary at the midpoint. Afterwards the new track glides back to the normal rate over ~12 s.
+- If either track has no confident steady beat, or the tempos are too far apart, it falls back to the regular crossfade.
+
 ## Equalizer
 `setEqualizer(bands)` takes 10 gains in dB (−12…+12) for 31, 62, 125, 250, 500, 1k, 2k, 4k, 8k, 16k Hz.
 - iOS: SABR and HLS (including downloaded HLS) render through a shared `AVAudioEngine` graph with `AVAudioUnitEQ`; HLS is demuxed and decoded in-process (TS/fMP4, AAC/HE-AAC, AES-128) because AVPlayer cannot tap HLS audio. Raw URLs use an `MTAudioProcessingTap`. HLS streams the engine cannot decode (FairPlay/SAMPLE-AES, HEVC-only, AC-3) fall back to AVPlayer without EQ.

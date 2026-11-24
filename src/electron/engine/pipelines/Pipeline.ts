@@ -4,6 +4,7 @@ import type {
   NativeVideoQualityRange,
 } from '../../../specs/EverythingPlayer.nitro'
 import { audioGraph } from '../AudioGraph'
+import { BeatAnalyzer } from '../BeatAnalyzer'
 import type { Host } from '../host'
 import { EPError, trimEnd, type QualityState } from '../models'
 import { videoHub } from '../VideoHub'
@@ -42,7 +43,9 @@ export interface PipelineContext {
 interface PooledElement {
   element: HTMLVideoElement
   gain: GainNode
+  shelf: BiquadFilterNode
   busy: boolean
+  sink?: (input: AudioBuffer) => void
 }
 
 const pool: PooledElement[] = []
@@ -56,7 +59,8 @@ function acquire(): PooledElement {
     element.playsInline = true
     element.disableRemotePlayback = true
     element.preservesPitch = true
-    entry = { element, gain: audioGraph.connect(element), busy: false }
+    const created: PooledElement = { element, busy: false, ...audioGraph.connect(element, (input) => created.sink?.(input)) }
+    entry = created
     pool.push(entry)
   }
   entry.busy = true
@@ -81,6 +85,7 @@ export abstract class Pipeline {
   delegate: PipelineDelegate | undefined
   status: PipelineStatus = 'idle'
   readonly element: HTMLVideoElement
+  readonly beats = new BeatAnalyzer()
 
   protected disposed = false
   protected wantsPlay = false
@@ -89,6 +94,7 @@ export abstract class Pipeline {
   private readonly pooled: PooledElement
   private volumeValue = 1
   private rateValue = 1
+  private bassCutValue = 0
   private readonly listeners: [string, EventListener][] = []
 
   constructor(
@@ -97,6 +103,7 @@ export abstract class Pipeline {
   ) {
     this.pooled = acquire()
     this.element = this.pooled.element
+    this.pooled.sink = (input) => this.analyze(input)
     this.listen('playing', () => {
       this.frozenPosition = undefined
       if (this.wantsPlay) this.setStatus('playing')
@@ -241,6 +248,24 @@ export abstract class Pipeline {
     this.element.defaultPlaybackRate = value
   }
 
+  get bassCut(): number {
+    return this.bassCutValue
+  }
+
+  set bassCut(value: number) {
+    this.bassCutValue = value
+    audioGraph.setBassCut(this.pooled.shelf, value)
+  }
+
+  private analyze(input: AudioBuffer): void {
+    if (this.element.paused || this.frozenPosition !== undefined || this.element.seeking) return
+    const rate = this.element.playbackRate || 1
+    const channels: Float32Array[] = []
+    for (let c = 0; c < input.numberOfChannels; c++) channels.push(input.getChannelData(c))
+    const at = this.element.currentTime - input.duration * rate
+    this.beats.push(channels, input.length, input.sampleRate / rate, at, 0.08)
+  }
+
   get hasVideo(): boolean {
     return this.ctx.options.enableVideo && this.element.videoWidth > 0
   }
@@ -271,6 +296,8 @@ export abstract class Pipeline {
     }
     this.element.pause()
     this.pooled.gain.gain.value = 0
+    this.pooled.sink = undefined
+    audioGraph.setBassCut(this.pooled.shelf, 0)
     const element = this.element
     const pooled = this.pooled
     const recycle = () => {

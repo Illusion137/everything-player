@@ -30,6 +30,7 @@ import {
   trimEnd,
   trimStart,
 } from './models'
+import { downbeatAtOrAfter, downbeatAtOrBefore, type BeatGrid } from './BeatAnalyzer'
 import { LocalSabrPipeline } from './pipelines/LocalSabrPipeline'
 import type {
   LocalMedia,
@@ -73,6 +74,35 @@ function copyTrack(track: NativeTrack): NativeTrack {
   }
 }
 
+const MIX = {
+  prepare: 45,
+  planLead: 10,
+  cue: 16,
+  minConfidence: 0.15,
+  maxStretch: 0.08,
+  gain: 2,
+  glideSeconds: 12,
+  frameMs: 1000 / 60,
+}
+
+interface MixPlan {
+  outGrid: BeatGrid
+  inPeriod: number
+  mixStart: number
+  inStart: number
+  beats: number
+  swapBeat: number
+  ratio: number
+  started: boolean
+  lastRate: number
+  frames: number
+}
+
+const ease = (p: number) => {
+  const x = Math.min(1, Math.max(0, p))
+  return x * x * (3 - 2 * x)
+}
+
 export class ElectronPlayer implements PlayerBackend, PipelineDelegate {
   private setup = false
   private options: NativeSetupOptions = DEFAULT_SETUP
@@ -92,6 +122,11 @@ export class ElectronPlayer implements PlayerBackend, PipelineDelegate {
   private primary: Pipeline | undefined
   private secondary: Pipeline | undefined
   private fading = false
+  private mixPlan: MixPlan | undefined
+  private mixTimer: ReturnType<typeof setInterval> | undefined
+  private cueing = false
+  private djFailed = false
+  private rateGlide: { from: number; start: number } | undefined
   private ticks = 0
   private tickTimer: ReturnType<typeof setInterval> | undefined
   private progressTimer: ReturnType<typeof setInterval> | undefined
@@ -183,6 +218,7 @@ export class ElectronPlayer implements PlayerBackend, PipelineDelegate {
 
   setRate(rate: number): void {
     this.rateValue = rate
+    this.rateGlide = undefined
     if (this.primary) this.primary.rate = rate
     if (this.secondary) this.secondary.rate = rate
     this.refreshNowPlaying()
@@ -388,7 +424,7 @@ export class ElectronPlayer implements PlayerBackend, PipelineDelegate {
       return
     }
     this.primary.play()
-    if (this.fading) this.secondary?.play()
+    if (this.fading && this.mixPlan?.started !== false) this.secondary?.play()
     this.syncState()
   }
 
@@ -434,6 +470,10 @@ export class ElectronPlayer implements PlayerBackend, PipelineDelegate {
     this.pendingSeek = target
     this.onProgress?.(this.progressEvent())
     this.cancelFade()
+    if (this.rateGlide && this.primary) {
+      this.rateGlide = undefined
+      this.primary.rate = this.rateValue
+    }
     if (this.primary) this.primary.seek(target)
     else this.loadActive(target)
     this.refreshNowPlaying()
@@ -577,7 +617,8 @@ export class ElectronPlayer implements PlayerBackend, PipelineDelegate {
     const s = this.secondary
     this.primary = undefined
     this.secondary = undefined
-    this.fading = false
+    this.endFade()
+    this.rateGlide = undefined
     p?.teardown()
     s?.teardown()
     videoHub.setActive(null)
@@ -606,14 +647,18 @@ export class ElectronPlayer implements PlayerBackend, PipelineDelegate {
   ): void {
     const next = this.secondary
     if (!next) return
+    const glideFrom = this.mixPlan ? next.rate : undefined
     const old = this.primary
     this.primary = next
     this.secondary = undefined
     this.activeIndex = newIndex
     this.pendingSeek = undefined
-    this.fading = false
+    this.endFade()
     old?.teardown()
     next.volume = this.volumeValue
+    next.bassCut = 0
+    this.rateGlide =
+      glideFrom !== undefined && glideFrom !== this.rateValue ? { from: glideFrom, start: next.currentTime } : undefined
     this.updateVideoSource()
     if (this.playWhenReady) next.play()
     this.emitActiveChange(lastIndex, lastId, lastPosition)
@@ -625,11 +670,21 @@ export class ElectronPlayer implements PlayerBackend, PipelineDelegate {
 
   private cancelFade(): void {
     if (!this.fading) return
-    this.fading = false
+    this.endFade()
     const s = this.secondary
     this.secondary = undefined
     s?.teardown()
-    if (this.primary) this.primary.volume = this.volumeValue
+    if (this.primary) {
+      this.primary.volume = this.volumeValue
+      this.primary.bassCut = 0
+    }
+  }
+
+  private endFade(): void {
+    this.fading = false
+    this.mixPlan = undefined
+    if (this.mixTimer !== undefined) clearInterval(this.mixTimer)
+    this.mixTimer = undefined
   }
 
   private invalidateSecondaryIfStale(): void {
@@ -800,6 +855,7 @@ export class ElectronPlayer implements PlayerBackend, PipelineDelegate {
     this.ticks += 1
     if (this.ticks % 300 === 0) this.warmUpcomingSabr()
     if (this.ticks % 10 === 0) this.refreshNowPlaying()
+    this.applyRateGlide(primary)
     const track = primary.track
     const fadeLength = this.crossfadeSeconds
     const end = trimEnd(track, primary.mediaDuration)
@@ -807,14 +863,18 @@ export class ElectronPlayer implements PlayerBackend, PipelineDelegate {
     const remaining = end - primary.currentTime
     const nextIdx = this.nextIndex(false)
     const canFade = fadeLength > 0 && this.repeatMode !== 'track' && end - trimStart(track) >= 2 * fadeLength
+    const dj = canFade && this.update.djCrossfade
+    const lookahead = canFade ? fadeLength + (dj ? MIX.prepare : 0) : 0
 
-    if (!this.secondary && nextIdx !== undefined && this.repeatMode !== 'track' && remaining <= Math.max(fadeLength, 0) + 8 && remaining > 0.25) {
+    if (!this.secondary && nextIdx !== undefined && this.repeatMode !== 'track' && remaining <= lookahead + 8 && remaining > 0.25) {
       const nextTrack = this.queue[nextIdx]
       if (nextTrack) {
         try {
           const pipeline = this.makePipeline(nextTrack)
           pipeline.volume = canFade ? 0 : this.volumeValue
           this.secondary = pipeline
+          this.cueing = false
+          this.djFailed = false
           pipeline.load(trimStart(nextTrack))
         } catch {}
       }
@@ -822,6 +882,10 @@ export class ElectronPlayer implements PlayerBackend, PipelineDelegate {
 
     const secondary = this.secondary
     if (!canFade || !secondary || this.state !== 'playing') return
+    if (dj && !this.djFailed) {
+      if (!this.fading) this.prepareMix(primary, secondary, end, remaining, fadeLength)
+      return
+    }
     if (!this.fading && remaining <= fadeLength && (secondary.status === 'ready' || secondary.status === 'playing')) {
       this.fading = true
       secondary.volume = 0
@@ -832,6 +896,139 @@ export class ElectronPlayer implements PlayerBackend, PipelineDelegate {
     primary.volume = this.volumeValue * Math.cos((p * Math.PI) / 2)
     secondary.volume = this.volumeValue * Math.sin((p * Math.PI) / 2)
     if (remaining <= 0.05) this.finishFade()
+  }
+
+  private prepareMix(primary: Pipeline, secondary: Pipeline, end: number, remaining: number, fadeLength: number): void {
+    if (secondary.status === 'failed') return
+    if (secondary.status !== 'ready' && secondary.status !== 'playing' && secondary.status !== 'buffering') {
+      if (remaining <= fadeLength + 1) this.failMix(secondary)
+      return
+    }
+    const inFrom = trimStart(secondary.track)
+    const inTo = Math.min(inFrom + MIX.cue, trimEnd(secondary.track, secondary.mediaDuration) ?? Infinity)
+    if (!secondary.beats.covered(inFrom, inTo)) {
+      if (remaining <= fadeLength + 1) return this.failMix(secondary)
+      if (!this.cueing || secondary.status === 'ready') {
+        this.cueing = true
+        secondary.volume = 0
+        secondary.play()
+      }
+      return
+    }
+    if (this.cueing) {
+      this.cueing = false
+      secondary.pause()
+    }
+    if (remaining > fadeLength + MIX.planLead) return
+
+    const position = primary.currentTime
+    const rate = this.rateValue
+    const outGrid = primary.beats.grid(Math.max(trimStart(primary.track), position - 30), end)
+    const inGrid = secondary.beats.grid(inFrom, inTo)
+    if (!outGrid || !inGrid || outGrid.confidence < MIX.minConfidence || inGrid.confidence < MIX.minConfidence) {
+      return this.failMix(secondary)
+    }
+    let match: { ratio: number; period: number } | undefined
+    for (const multiple of [1, 2, 0.5]) {
+      const period = inGrid.period * multiple
+      const ratio = period / outGrid.period
+      if (Math.abs(Math.log(ratio)) > Math.log(1 + MIX.maxStretch)) continue
+      if (!match || Math.abs(Math.log(ratio)) < Math.abs(Math.log(match.ratio))) match = { ratio, period }
+    }
+    if (!match) return this.failMix(secondary)
+
+    let beats = Math.max(8, Math.round((fadeLength * rate) / outGrid.period / 4) * 4)
+    const earliest = position + 2 * outGrid.period
+    let mixStart = downbeatAtOrBefore(outGrid, end - beats * outGrid.period)
+    while (mixStart < earliest && beats > 8) {
+      beats -= 4
+      mixStart = downbeatAtOrBefore(outGrid, end - beats * outGrid.period)
+    }
+    const inStart = downbeatAtOrAfter(inGrid, inFrom)
+    if (mixStart < earliest || inStart >= inTo) return this.failMix(secondary)
+
+    this.mixPlan = {
+      outGrid,
+      inPeriod: match.period,
+      mixStart,
+      inStart,
+      beats,
+      swapBeat: Math.max(4, Math.floor(beats / 8) * 4),
+      ratio: match.ratio,
+      started: false,
+      lastRate: 0,
+      frames: 0,
+    }
+    this.fading = true
+    secondary.volume = 0
+    secondary.bassCut = 1
+    secondary.rate = rate * match.ratio
+    secondary.seek(inStart)
+    if (this.mixTimer === undefined) this.mixTimer = setInterval(() => this.stepMix(), MIX.frameMs)
+  }
+
+  private failMix(secondary: Pipeline): void {
+    this.djFailed = true
+    if (this.cueing) {
+      this.cueing = false
+      secondary.pause()
+    }
+    secondary.volume = 0
+    secondary.rate = this.rateValue
+    const start = trimStart(secondary.track)
+    if (Math.abs(secondary.currentTime - start) > 0.05) secondary.seek(start)
+  }
+
+  private stepMix(): void {
+    const primary = this.primary
+    const secondary = this.secondary
+    const plan = this.mixPlan
+    if (!this.fading || !primary || !secondary || !plan || !this.playWhenReady) return
+    const rate = this.rateValue
+    const outBeat = (primary.currentTime - plan.mixStart) / plan.outGrid.period
+    if (!plan.started) {
+      if (secondary.status !== 'ready' && secondary.status !== 'playing') {
+        if (outBeat > 1) {
+          this.endFade()
+          this.failMix(secondary)
+        }
+        return
+      }
+      if (outBeat < -((MIX.frameMs / 1000) * rate) / plan.outGrid.period) return
+      plan.started = true
+      plan.lastRate = secondary.rate
+      secondary.play()
+      return
+    }
+
+    plan.frames += 1
+    if (secondary.status === 'playing' && plan.frames % 6 === 0) {
+      let error = (secondary.currentTime - plan.inStart) / plan.inPeriod - outBeat
+      error -= Math.round(error)
+      const seconds = (error * plan.outGrid.period) / rate
+      const limit = Math.abs(seconds) > 0.05 ? 0.06 : 0.02
+      const target = rate * plan.ratio * (1 + Math.max(-limit, Math.min(limit, -seconds * MIX.gain)))
+      if (Math.abs(target - plan.lastRate) > 0.0005) {
+        secondary.rate = target
+        plan.lastRate = target
+      }
+    }
+
+    const p = Math.min(1, Math.max(0, outBeat / plan.beats))
+    const swap = Math.min(1, Math.max(0, (outBeat - plan.swapBeat) / 0.25 + 1))
+    primary.volume = this.volumeValue * (1 - ease(p * 2 - 1))
+    secondary.volume = this.volumeValue * ease(p * 2)
+    primary.bassCut = swap
+    secondary.bassCut = 1 - swap
+    if (p >= 1) this.finishFade()
+  }
+
+  private applyRateGlide(primary: Pipeline): void {
+    const glide = this.rateGlide
+    if (!glide) return
+    const p = Math.min(1, Math.max(0, (primary.currentTime - glide.start) / MIX.glideSeconds))
+    primary.rate = glide.from + (this.rateValue - glide.from) * ease(p)
+    if (p >= 1) this.rateGlide = undefined
   }
 
   private warmUpcomingSabr(): void {

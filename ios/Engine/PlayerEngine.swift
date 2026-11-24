@@ -12,6 +12,24 @@ private struct EPFadeState {
   var quiet: Bool
 }
 
+private struct EPMixPlan {
+  var outGrid: EPBeatGrid
+  var inPeriod: Double
+  var mixStart: Double
+  var inStart: Double
+  var beats: Double
+  var swapBeat: Double
+  var ratio: Double
+  var started = false
+  var lastRate: Float = 0
+  var frames = 0
+}
+
+private struct EPRateGlide {
+  var from: Float
+  var start: Double
+}
+
 struct EPActiveTrackChange {
   var lastIndex: Int?
   var lastTrackId: String?
@@ -57,6 +75,10 @@ final class EPPlayerEngine: EPPipelineDelegate {
   private var fadeState: EPFadeState?
   private var fadeTimer: DispatchSourceTimer?
   private var quietSince: Double?
+  private var mixPlan: EPMixPlan?
+  private var cueing = false
+  private var djFailed = false
+  private var rateGlide: EPRateGlide?
   private var tickTimer: DispatchSourceTimer?
   private var progressTimer: DispatchSourceTimer?
   private var resumeAfterInterruption = false
@@ -158,6 +180,7 @@ final class EPPlayerEngine: EPPipelineDelegate {
   func setRate(_ rate: Float) {
     locked { rateValue = rate }
     onMain {
+      self.rateGlide = nil
       self.primary?.rate = rate
       self.secondary?.rate = rate
       self.refreshNowPlaying()
@@ -364,7 +387,7 @@ final class EPPlayerEngine: EPPipelineDelegate {
       }
       if case .failed = self.primary?.status { self.retry(); return }
       self.primary?.play()
-      if self.fading { self.secondary?.play() }
+      if self.fading && self.mixPlan?.started != false { self.secondary?.play() }
       self.syncState()
     }
   }
@@ -429,6 +452,10 @@ final class EPPlayerEngine: EPPipelineDelegate {
     onProgress?(progress, getActiveIndex(), currentTrackId())
     onMain {
       self.cancelFade()
+      if self.rateGlide != nil {
+        self.rateGlide = nil
+        self.primary?.rate = self.locked { self.rateValue }
+      }
       if let primary = self.primary {
         primary.seek(to: target)
       } else {
@@ -506,6 +533,7 @@ final class EPPlayerEngine: EPPipelineDelegate {
       return r
     }
     endFade()
+    rateGlide = nil
     p?.delegate = nil
     s?.delegate = nil
     p?.teardown()
@@ -528,6 +556,7 @@ final class EPPlayerEngine: EPPipelineDelegate {
 
   private func promoteSecondary(lastIndex: Int?, lastId: String?, lastPosition: Double, newIndex: Int) {
     guard let next = secondary else { return }
+    let glideFrom: Float? = mixPlan != nil ? next.rate : nil
     let old: EPPipeline? = locked {
       let o = primary
       primary = next
@@ -541,6 +570,11 @@ final class EPPlayerEngine: EPPipelineDelegate {
     old?.teardown()
     next.volume = locked { volumeValue }
     next.bassCut = 0
+    if let glideFrom, glideFrom != locked({ rateValue }) {
+      rateGlide = EPRateGlide(from: glideFrom, start: next.currentTime)
+    } else {
+      rateGlide = nil
+    }
     EPVideoHub.shared.setSource(next.videoSource)
     if locked({ playWhenReady }) { next.play() }
     emitActiveChange(lastIndex: lastIndex, lastTrackId: lastId, lastPosition: lastPosition)
@@ -567,6 +601,7 @@ final class EPPlayerEngine: EPPipelineDelegate {
   private func endFade() {
     fading = false
     fadeState = nil
+    mixPlan = nil
     quietSince = nil
     fadeTimer?.cancel()
     fadeTimer = nil
@@ -726,30 +761,39 @@ final class EPPlayerEngine: EPPipelineDelegate {
     guard let primary, locked({ playWhenReady }) else { return }
     sabrTicks += 1
     if sabrTicks % 300 == 0 { warmUpcomingSabr() }
-    let (track, fadeLength, mode, volume) = locked { (primary.track, crossfadeSeconds, repeatModeValue, volumeValue) }
+    applyRateGlide(primary)
+    let (track, fadeLength, mode, volume, djOption) = locked { (primary.track, crossfadeSeconds, repeatModeValue, volumeValue, updateOptions.djCrossfade) }
     guard let end = track.trimEnd(mediaDuration: primary.mediaDuration) else { return }
     let position = primary.currentTime
     let remaining = end - position
     let nextIdx = locked { nextIndex(ignoringRepeatTrack: false) }
     let canFade = fadeLength > 0 && mode != .track && (end - track.trimStart) >= 2 * fadeLength
+    let dj = canFade && djOption
 
-    let lookahead = canFade ? fadeLength + EPBlend.silenceLookahead : 0
+    let lookahead = canFade ? fadeLength + (dj ? EPMix.prepare : EPBlend.silenceLookahead) : 0
     if secondary == nil, let nextIdx, mode != .track, remaining <= lookahead + 8, remaining > 0.25 {
       let nextTrack = locked { queue[nextIdx] }
       let pipeline = makePipeline(for: nextTrack)
       pipeline.volume = canFade ? 0 : volume
       locked { secondary = pipeline }
+      cueing = false
+      djFailed = false
       pipeline.load(at: nextTrack.trimStart)
     }
 
     guard canFade, let secondary, getState() == .playing, !fading else { return }
+    if dj && !djFailed {
+      prepareMix(primary, secondary, end: end, remaining: remaining, fadeLength: fadeLength)
+      return
+    }
     let quiet = reachedTrailingSilence(primary, position: position, remaining: remaining, fadeLength: fadeLength)
     guard remaining <= fadeLength || quiet, secondary.status == .ready || secondary.status == .playing else { return }
     beginFade(secondary, quiet: quiet)
   }
 
   private func reachedTrailingSilence(_ primary: EPPipeline, position: Double, remaining: Double, fadeLength: Double) -> Bool {
-    guard remaining <= fadeLength + EPBlend.silenceLookahead, remaining > EPBlend.minFade,
+    guard primary.track.endTime == nil,
+          remaining <= fadeLength + EPBlend.silenceLookahead, remaining > EPBlend.minFade,
           let level = primary.level, level < EPBlend.silenceLevel else {
       quietSince = nil
       return false
@@ -765,12 +809,147 @@ final class EPPlayerEngine: EPPipelineDelegate {
     secondary.bassCut = 1
     secondary.play()
     fadeState = EPFadeState(introStart: secondary.currentTime, start: nil, duration: 0, quiet: quiet)
+    startFadeTimer()
+  }
+
+  private func startFadeTimer() {
     guard fadeTimer == nil else { return }
     let timer = DispatchSource.makeTimerSource(queue: .main)
     timer.schedule(deadline: .now(), repeating: EPBlend.frameInterval)
-    timer.setEventHandler { [weak self] in self?.stepFade() }
+    timer.setEventHandler { [weak self] in
+      guard let self else { return }
+      if self.mixPlan != nil { self.stepMix() } else { self.stepFade() }
+    }
     fadeTimer = timer
     timer.resume()
+  }
+
+  private func prepareMix(_ primary: EPPipeline, _ secondary: EPPipeline, end: Double, remaining: Double, fadeLength: Double) {
+    switch secondary.status {
+    case .ready, .playing, .buffering: break
+    case .failed: return
+    default:
+      if remaining <= fadeLength + 1 { failMix(secondary) }
+      return
+    }
+    guard let outBeats = primary.beats, let inBeats = secondary.beats else { return failMix(secondary) }
+    let inFrom = secondary.track.trimStart
+    let inTo = min(inFrom + EPMix.cue, secondary.track.trimEnd(mediaDuration: secondary.mediaDuration) ?? .infinity)
+    if !inBeats.covered(from: inFrom, to: inTo) {
+      if remaining <= fadeLength + 1 { return failMix(secondary) }
+      if !cueing || secondary.status == .ready {
+        cueing = true
+        secondary.volume = 0
+        secondary.play()
+      }
+      return
+    }
+    if cueing {
+      cueing = false
+      secondary.pause()
+    }
+    guard remaining <= fadeLength + EPMix.planLead else { return }
+
+    let position = primary.currentTime
+    let rate = Double(locked { rateValue })
+    guard let outGrid = outBeats.grid(from: max(primary.track.trimStart, position - 30), to: end),
+          let inGrid = inBeats.grid(from: inFrom, to: inTo),
+          outGrid.confidence >= EPMix.minConfidence, inGrid.confidence >= EPMix.minConfidence else { return failMix(secondary) }
+
+    var match: (ratio: Double, period: Double)?
+    for multiple in [1.0, 2.0, 0.5] {
+      let period = inGrid.period * multiple
+      let ratio = period / outGrid.period
+      guard Swift.abs(log(ratio)) <= log(1 + EPMix.maxStretch) else { continue }
+      if match == nil || Swift.abs(log(ratio)) < Swift.abs(log(match!.ratio)) { match = (ratio, period) }
+    }
+    guard let match else { return failMix(secondary) }
+
+    var beats = max(8, (fadeLength * rate / outGrid.period / 4).rounded() * 4)
+    let earliest = position + 2 * outGrid.period
+    var mixStart = outGrid.downbeat(atOrBefore: end - beats * outGrid.period)
+    while mixStart < earliest && beats > 8 {
+      beats -= 4
+      mixStart = outGrid.downbeat(atOrBefore: end - beats * outGrid.period)
+    }
+    let inStart = inGrid.downbeat(atOrAfter: inFrom)
+    guard mixStart >= earliest, inStart < inTo else { return failMix(secondary) }
+
+    mixPlan = EPMixPlan(
+      outGrid: outGrid, inPeriod: match.period, mixStart: mixStart, inStart: inStart,
+      beats: beats, swapBeat: max(4, (beats / 8).rounded(.down) * 4), ratio: match.ratio)
+    fading = true
+    secondary.volume = 0
+    secondary.bassCut = 1
+    secondary.rate = Float(rate * match.ratio)
+    secondary.seek(to: inStart)
+    startFadeTimer()
+  }
+
+  private func failMix(_ secondary: EPPipeline) {
+    djFailed = true
+    if cueing {
+      cueing = false
+      secondary.pause()
+    }
+    secondary.volume = 0
+    secondary.rate = locked { rateValue }
+    if Swift.abs(secondary.currentTime - secondary.track.trimStart) > 0.05 { secondary.seek(to: secondary.track.trimStart) }
+  }
+
+  private func abortMix() {
+    guard let secondary else { return }
+    endFade()
+    failMix(secondary)
+  }
+
+  private func stepMix() {
+    guard fading, let primary, let secondary, var plan = mixPlan, locked({ playWhenReady }) else { return }
+    let (volume, rate) = locked { (volumeValue, Double(rateValue)) }
+    let outPos = primary.currentTime
+    let outBeat = (outPos - plan.mixStart) / plan.outGrid.period
+    if !plan.started {
+      guard secondary.status == .ready || secondary.status == .playing else {
+        if outBeat > 1 { abortMix() }
+        return
+      }
+      guard outBeat >= -EPBlend.frameInterval * rate / plan.outGrid.period else { return }
+      plan.started = true
+      plan.lastRate = secondary.rate
+      mixPlan = plan
+      secondary.play()
+      return
+    }
+
+    plan.frames += 1
+    if secondary.status == .playing, plan.frames % 6 == 0 {
+      var error = (secondary.currentTime - plan.inStart) / plan.inPeriod - outBeat
+      error -= error.rounded()
+      let seconds = error * plan.outGrid.period / rate
+      let limit = Swift.abs(seconds) > 0.05 ? 0.06 : 0.02
+      let target = Float(rate * plan.ratio * (1 + max(-limit, min(limit, -seconds * EPMix.gain))))
+      if Swift.abs(target - plan.lastRate) > 0.0005 {
+        secondary.rate = target
+        plan.lastRate = target
+      }
+    }
+    mixPlan = plan
+
+    let p = min(1, max(0, outBeat / plan.beats))
+    let swap = Float(min(1, max(0, (outBeat - plan.swapBeat) / 0.25 + 1)))
+    primary.volume = volume * Float(1 - EPBlend.ease(p * 2 - 1))
+    secondary.volume = volume * Float(EPBlend.ease(p * 2))
+    primary.bassCut = swap
+    secondary.bassCut = 1 - swap
+    if p >= 1 { finishFade() }
+  }
+
+  private func applyRateGlide(_ primary: EPPipeline) {
+    guard let glide = rateGlide else { return }
+    let user = locked { rateValue }
+    let p = min(1, max(0, (primary.currentTime - glide.start) / EPMix.glideSeconds))
+    primary.rate = glide.from + (user - glide.from) * Float(EPBlend.ease(p))
+    if p >= 1 { rateGlide = nil }
   }
 
   private func stepFade() {
@@ -782,7 +961,7 @@ final class EPPlayerEngine: EPPipelineDelegate {
     if fade.start == nil {
       let elapsed = secondary.currentTime - fade.introStart
       let audible = elapsed >= 0.1 && (secondary.level ?? 1) >= EPBlend.silenceLevel
-      let waited = elapsed >= EPBlend.introWait
+      let waited = elapsed >= EPBlend.introWait || secondary.track.startTime != nil
       guard audible || waited || remaining <= EPBlend.minFade else { return }
       fade.start = position
       fade.duration = fade.quiet ? min(fadeLength, EPBlend.minFade) : max(0.05, min(fadeLength, remaining))

@@ -63,6 +63,7 @@ class HybridEverythingPlayer : HybridEverythingPlayerSpec() {
         progressUpdateEventInterval = options.progressUpdateEventInterval,
         forwardJumpInterval = options.forwardJumpInterval,
         backwardJumpInterval = options.backwardJumpInterval,
+        djCrossfade = options.djCrossfade,
         appKilledBehavior = when (options.appKilledPlaybackBehavior) {
           NativeAppKilledPlaybackBehavior.PAUSE_PLAYBACK -> EPAppKilledBehavior.PAUSE
           NativeAppKilledPlaybackBehavior.STOP_PLAYBACK_AND_REMOVE_NOTIFICATION -> EPAppKilledBehavior.STOP_AND_REMOVE

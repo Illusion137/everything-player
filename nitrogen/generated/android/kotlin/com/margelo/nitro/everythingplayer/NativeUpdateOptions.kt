@@ -32,6 +32,9 @@ data class NativeUpdateOptions(
   val backwardJumpInterval: Double,
   @DoNotStrip
   @Keep
+  val djCrossfade: Boolean,
+  @DoNotStrip
+  @Keep
   val appKilledPlaybackBehavior: NativeAppKilledPlaybackBehavior?
 ) {
   /* primary constructor */
@@ -43,6 +46,7 @@ data class NativeUpdateOptions(
       && Objects.deepEquals(this.progressUpdateEventInterval, other.progressUpdateEventInterval)
       && Objects.deepEquals(this.forwardJumpInterval, other.forwardJumpInterval)
       && Objects.deepEquals(this.backwardJumpInterval, other.backwardJumpInterval)
+      && Objects.deepEquals(this.djCrossfade, other.djCrossfade)
       && Objects.deepEquals(this.appKilledPlaybackBehavior, other.appKilledPlaybackBehavior)
   }
 
@@ -52,6 +56,7 @@ data class NativeUpdateOptions(
       progressUpdateEventInterval,
       forwardJumpInterval,
       backwardJumpInterval,
+      djCrossfade,
       appKilledPlaybackBehavior
     ).contentDeepHashCode()
   }
@@ -64,8 +69,8 @@ data class NativeUpdateOptions(
     @Keep
     @Suppress("unused")
     @JvmStatic
-    private fun fromCpp(capabilities: Array<NativeCapability>, progressUpdateEventInterval: Double, forwardJumpInterval: Double, backwardJumpInterval: Double, appKilledPlaybackBehavior: NativeAppKilledPlaybackBehavior?): NativeUpdateOptions {
-      return NativeUpdateOptions(capabilities, progressUpdateEventInterval, forwardJumpInterval, backwardJumpInterval, appKilledPlaybackBehavior)
+    private fun fromCpp(capabilities: Array<NativeCapability>, progressUpdateEventInterval: Double, forwardJumpInterval: Double, backwardJumpInterval: Double, djCrossfade: Boolean, appKilledPlaybackBehavior: NativeAppKilledPlaybackBehavior?): NativeUpdateOptions {
+      return NativeUpdateOptions(capabilities, progressUpdateEventInterval, forwardJumpInterval, backwardJumpInterval, djCrossfade, appKilledPlaybackBehavior)
     }
   }
 }

@@ -31,6 +31,7 @@ final class EPBlendControl {
   var level: Float = 0
   var metered = false
   var bassCut: Float = 0
+  let beats = EPBeatAnalyzer()
 }
 
 private final class EPTapContext {
@@ -143,12 +144,14 @@ enum EPEqualizerTap {
       },
       unprepare: nil,
       process: { tap, frames, _, bufferList, framesOut, flagsOut in
-        guard MTAudioProcessingTapGetSourceAudio(tap, frames, bufferList, flagsOut, nil, framesOut) == noErr else { return }
+        var range = CMTimeRange()
+        guard MTAudioProcessingTapGetSourceAudio(tap, frames, bufferList, flagsOut, &range, framesOut) == noErr else { return }
         let ctx = Unmanaged<EPTapContext>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).takeUnretainedValue()
         ctx.refresh()
         let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
         let n = Int(framesOut.pointee)
         ctx.meter(buffers, frames: n)
+        if range.start.isNumeric { ctx.blend.beats.push(buffers, frames: n, sampleRate: ctx.sampleRate, at: range.start.seconds) }
         let shelving = ctx.refreshShelf()
         guard !ctx.flat || shelving else { return }
         let bands = ctx.bandCount

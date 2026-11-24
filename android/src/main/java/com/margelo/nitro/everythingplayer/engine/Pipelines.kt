@@ -18,6 +18,9 @@ import androidx.media3.common.VideoSize
 import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.MediaSource
@@ -54,6 +57,8 @@ interface EPPipeline {
   val bufferedTime: Double
   var volume: Float
   var rate: Float
+  var bassCut: Float
+  val beats: EPBeatAnalyzer?
   val exoPlayer: ExoPlayer?
   val videoQuality: EPVideoQualityState
 
@@ -80,6 +85,8 @@ open class EPExoPipeline(
     private set
 
   protected val player: ExoPlayer
+  override val beats = EPBeatAnalyzer()
+  private val shelf = EPBassShelfProcessor()
   private var equalizer: EPEqualizerController? = null
   private var frozenPosition: Double? = null
   private var seeking = false
@@ -101,7 +108,18 @@ open class EPExoPipeline(
       .setTargetBufferBytes(options.maxBufferBytes)
       .setPrioritizeTimeOverSizeThresholds(false)
       .build()
-    player = ExoPlayer.Builder(context)
+    val renderers = object : DefaultRenderersFactory(context) {
+      override fun buildAudioSink(context: Context, enableFloatOutput: Boolean, enableAudioTrackPlaybackParams: Boolean): AudioSink =
+        EPAnalyzingAudioSink(
+          DefaultAudioSink.Builder(context)
+            .setEnableFloatOutput(enableFloatOutput)
+            .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+            .setAudioProcessors(arrayOf(shelf))
+            .build(),
+          beats,
+        )
+    }
+    player = ExoPlayer.Builder(context, renderers)
       .setLoadControl(loadControl)
       .setAudioAttributes(
         AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build(),
@@ -193,6 +211,10 @@ open class EPExoPipeline(
   override var rate: Float
     get() = player.playbackParameters.speed
     set(value) { player.playbackParameters = PlaybackParameters(value) }
+
+  override var bassCut: Float
+    get() = shelf.cut
+    set(value) { shelf.cut = value.coerceIn(0f, 1f) }
 
   protected open fun mediaSource(position: Double): MediaSource {
     val uri = Uri.parse(track.url ?: throw EPError(EPErrorCode.SOURCE_ERROR, "Track ${track.id} has no URL"))

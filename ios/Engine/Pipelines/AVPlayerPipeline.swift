@@ -76,6 +76,8 @@ final class EPAVPlayerPipeline: NSObject, EPPipeline, EPVideoFrameSource {
 
   var level: Float? { blend.metered ? blend.level : nil }
 
+  var beats: EPBeatAnalyzer? { blend.beats }
+
   var bassCut: Float {
     get { blend.bassCut }
     set { blend.bassCut = min(1, max(0, newValue)) }

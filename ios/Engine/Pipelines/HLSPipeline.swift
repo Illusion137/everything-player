@@ -229,6 +229,8 @@ final class EPHLSPipeline: EPPipeline, EPPipelineDelegate {
 
   var level: Float? { inner.map { $0.level } ?? renderer.level }
 
+  var beats: EPBeatAnalyzer? { inner.map { $0.beats } ?? renderer.beats }
+
   var bassCut: Float {
     get { inner?.bassCut ?? bassCutValue }
     set {

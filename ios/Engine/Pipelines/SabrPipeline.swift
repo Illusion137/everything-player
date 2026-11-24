@@ -83,6 +83,8 @@ final class EPSabrPipeline: EPPipeline {
 
   var level: Float? { renderer.level }
 
+  var beats: EPBeatAnalyzer? { renderer.beats }
+
   var bassCut: Float {
     get { renderer.bassCut }
     set { renderer.bassCut = newValue }

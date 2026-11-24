@@ -78,6 +78,7 @@ final class EPAudioRenderer {
   private let node = AVAudioPlayerNode()
   private let timePitch = AVAudioUnitTimePitch()
   private let shelf = AVAudioUnitEQ(numberOfBands: 1)
+  let beats = EPBeatAnalyzer()
   private var levels: [(end: AVAudioFramePosition, rms: Float)] = []
   private let lock = NSLock()
   private var format: AVAudioFormat?
@@ -194,9 +195,11 @@ final class EPAudioRenderer {
     }
     let rms = Self.rms(buffer)
     lock.lock()
+    let start = baseSeconds + Double(scheduledFrames) / buffer.format.sampleRate
     scheduledFrames += AVAudioFramePosition(buffer.frameLength)
     levels.append((scheduledFrames, rms))
     lock.unlock()
+    beats.push(buffer, at: start)
     node.scheduleBuffer(buffer, completionHandler: nil)
   }
 

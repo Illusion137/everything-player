@@ -106,12 +106,8 @@ data class EPTrack(
   val trimStart: Double get() = maxOf(0.0, startTime ?: 0.0)
 
   fun trimEnd(mediaDuration: Double?): Double? {
-    val known = duration ?: mediaDuration
-    return when {
-      endTime != null && known != null -> minOf(endTime, known)
-      endTime != null -> endTime
-      else -> known
-    }
+    val end = endTime ?: return duration ?: mediaDuration
+    return if (mediaDuration != null && mediaDuration > trimStart) minOf(end, mediaDuration) else end
   }
 }
 
@@ -182,6 +178,7 @@ data class EPUpdateOptions(
   val progressUpdateEventInterval: Double = 0.0,
   val forwardJumpInterval: Double = 15.0,
   val backwardJumpInterval: Double = 15.0,
+  val djCrossfade: Boolean = false,
   val appKilledBehavior: EPAppKilledBehavior = EPAppKilledBehavior.CONTINUE,
 )
 

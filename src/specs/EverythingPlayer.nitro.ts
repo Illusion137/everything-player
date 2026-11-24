@@ -150,6 +150,7 @@ export interface NativeUpdateOptions {
   progressUpdateEventInterval: number
   forwardJumpInterval: number
   backwardJumpInterval: number
+  djCrossfade: boolean
   appKilledPlaybackBehavior?: NativeAppKilledPlaybackBehavior
 }
 

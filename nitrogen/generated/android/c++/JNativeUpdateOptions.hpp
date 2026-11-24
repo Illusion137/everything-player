@@ -44,6 +44,8 @@ namespace margelo::nitro::everythingplayer {
       double forwardJumpInterval = this->getFieldValue(fieldForwardJumpInterval);
       static const auto fieldBackwardJumpInterval = clazz->getField<double>("backwardJumpInterval");
       double backwardJumpInterval = this->getFieldValue(fieldBackwardJumpInterval);
+      static const auto fieldDjCrossfade = clazz->getField<jboolean>("djCrossfade");
+      jboolean djCrossfade = this->getFieldValue(fieldDjCrossfade);
       static const auto fieldAppKilledPlaybackBehavior = clazz->getField<JNativeAppKilledPlaybackBehavior>("appKilledPlaybackBehavior");
       jni::local_ref<JNativeAppKilledPlaybackBehavior> appKilledPlaybackBehavior = this->getFieldValue(fieldAppKilledPlaybackBehavior);
       return NativeUpdateOptions(
@@ -60,6 +62,7 @@ namespace margelo::nitro::everythingplayer {
         progressUpdateEventInterval,
         forwardJumpInterval,
         backwardJumpInterval,
+        static_cast<bool>(djCrossfade),
         appKilledPlaybackBehavior != nullptr ? std::make_optional(appKilledPlaybackBehavior->toCpp()) : std::nullopt
       );
     }
@@ -70,7 +73,7 @@ namespace margelo::nitro::everythingplayer {
      */
     [[maybe_unused]]
     static jni::local_ref<JNativeUpdateOptions::javaobject> fromCpp(const NativeUpdateOptions& value) {
-      using JSignature = JNativeUpdateOptions(jni::alias_ref<jni::JArrayClass<JNativeCapability>>, double, double, double, jni::alias_ref<JNativeAppKilledPlaybackBehavior>);
+      using JSignature = JNativeUpdateOptions(jni::alias_ref<jni::JArrayClass<JNativeCapability>>, double, double, double, jboolean, jni::alias_ref<JNativeAppKilledPlaybackBehavior>);
       static const auto clazz = javaClassStatic();
       static const auto create = clazz->getStaticMethod<JSignature>("fromCpp");
       return create(
@@ -88,6 +91,7 @@ namespace margelo::nitro::everythingplayer {
         value.progressUpdateEventInterval,
         value.forwardJumpInterval,
         value.backwardJumpInterval,
+        value.djCrossfade,
         value.appKilledPlaybackBehavior.has_value() ? JNativeAppKilledPlaybackBehavior::fromCpp(value.appKilledPlaybackBehavior.value()) : nullptr
       );
     }
