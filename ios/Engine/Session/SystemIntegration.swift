@@ -5,6 +5,8 @@ import UIKit
 final class EPAudioSession {
   var onInterruption: ((_ began: Bool, _ shouldResume: Bool) -> Void)?
   var onOldDeviceUnavailable: (() -> Void)?
+  var onWillResignActive: (() -> Void)?
+  var onMediaServicesReset: (() -> Void)?
   private var tokens: [NSObjectProtocol] = []
 
   init() {
@@ -26,13 +28,22 @@ final class EPAudioSession {
             AVAudioSession.RouteChangeReason(rawValue: raw) == .oldDeviceUnavailable else { return }
       self?.onOldDeviceUnavailable?()
     })
+    tokens.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: session, queue: .main) { [weak self] _ in
+      self?.onMediaServicesReset?()
+    })
+    tokens.append(center.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+      self?.onWillResignActive?()
+    })
   }
 
   func configure() {
-    try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, policy: .longFormAudio)
+    let session = AVAudioSession.sharedInstance()
+    guard session.category != .playback || session.mode != .default || session.routeSharingPolicy != .longFormAudio else { return }
+    try? session.setCategory(.playback, mode: .default, policy: .longFormAudio)
   }
 
   func activate() {
+    configure()
     try? AVAudioSession.sharedInstance().setActive(true)
   }
 }

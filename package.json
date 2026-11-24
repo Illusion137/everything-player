@@ -1,6 +1,6 @@
 {
   "name": "react-native-everything-player",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Full-featured React Native media player (direct, HLS and YouTube SABR) built on Nitro Modules",
   "main": "./lib/commonjs/index.js",
   "module": "./lib/module/index.js",

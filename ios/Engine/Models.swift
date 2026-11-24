@@ -223,6 +223,26 @@ enum EPEqualizer {
   static let maxGain: Float = 12
 }
 
+enum EPBlend {
+  static let bassFrequency: Float = 180
+  static let bassCutGain: Float = -24
+  static let silenceLevel: Float = 0.008
+  static let silenceHold: Double = 1.0
+  static let silenceLookahead: Double = 12
+  static let introWait: Double = 1.5
+  static let minFade: Double = 1.5
+  static let frameInterval: Double = 1.0 / 60.0
+
+  static func ease(_ p: Double) -> Double {
+    let x = min(1, max(0, p))
+    return x * x * (3 - 2 * x)
+  }
+
+  static func window(_ p: Double, from: Double, to: Double) -> Double {
+    ease((p - from) / (to - from))
+  }
+}
+
 extension NSLocking {
   func sync<T>(_ body: () throws -> T) rethrows -> T {
     lock()

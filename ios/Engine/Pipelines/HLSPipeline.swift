@@ -173,6 +173,7 @@ final class EPHLSPipeline: EPPipeline, EPPipelineDelegate {
   private var released = false
   private var volumeValue: Float = 1
   private var rateValue: Float = 1
+  private var bassCutValue: Float = 0
 
   init(track: EPTrack, options: EPSetupOptions, localURL: URL?) {
     self.track = track
@@ -223,6 +224,16 @@ final class EPHLSPipeline: EPPipeline, EPPipelineDelegate {
     set {
       rateValue = newValue
       if let inner { inner.rate = newValue } else { renderer.rate = newValue }
+    }
+  }
+
+  var level: Float? { inner.map { $0.level } ?? renderer.level }
+
+  var bassCut: Float {
+    get { inner?.bassCut ?? bassCutValue }
+    set {
+      bassCutValue = newValue
+      if let inner { inner.bassCut = newValue } else { renderer.bassCut = newValue }
     }
   }
 
@@ -383,6 +394,7 @@ final class EPHLSPipeline: EPPipeline, EPPipelineDelegate {
       fallback.delegate = self
       fallback.volume = self.volumeValue
       fallback.rate = self.rateValue
+      fallback.bassCut = self.bassCutValue
       try? fallback.setVideoQuality(nil, range: self.qualityRange)
       self.inner = fallback
       fallback.load(at: position)

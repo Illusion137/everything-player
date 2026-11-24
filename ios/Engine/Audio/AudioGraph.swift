@@ -77,6 +77,8 @@ final class EPAudioRenderer {
   private let graph = EPAudioGraph.shared
   private let node = AVAudioPlayerNode()
   private let timePitch = AVAudioUnitTimePitch()
+  private let shelf = AVAudioUnitEQ(numberOfBands: 1)
+  private var levels: [(end: AVAudioFramePosition, rms: Float)] = []
   private let lock = NSLock()
   private var format: AVAudioFormat?
   private var baseSeconds: Double = 0
@@ -102,17 +104,42 @@ final class EPAudioRenderer {
     set { timePitch.rate = max(0.25, min(4, newValue)) }
   }
 
+  var bassCut: Float {
+    get { shelf.bands[0].gain / EPBlend.bassCutGain }
+    set { shelf.bands[0].gain = EPBlend.bassCutGain * min(1, max(0, newValue)) }
+  }
+
+  var level: Float? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard format != nil else { return nil }
+    let played = playedFramesLocked()
+    if let keep = levels.firstIndex(where: { $0.end > played }) {
+      if keep > 0 { levels.removeFirst(keep) }
+    } else {
+      levels.removeAll()
+    }
+    return levels.first?.rms ?? 0
+  }
+
   var isRendering: Bool { wantsToPlay && node.isPlaying }
 
   init() {
+    let band = shelf.bands[0]
+    band.filterType = .lowShelf
+    band.frequency = EPBlend.bassFrequency
+    band.gain = 0
+    band.bypass = false
     graph.engine.attach(node)
     graph.engine.attach(timePitch)
+    graph.engine.attach(shelf)
     graph.register(self)
   }
 
   deinit {
     watchdog?.cancel()
     node.stop()
+    graph.engine.detach(shelf)
     graph.engine.detach(timePitch)
     graph.engine.detach(node)
   }
@@ -132,6 +159,7 @@ final class EPAudioRenderer {
     baseSeconds = seconds
     scheduledFrames = 0
     lastPlayedFrames = 0
+    levels.removeAll()
     ended = false
     starved = false
     lock.unlock()
@@ -164,8 +192,10 @@ final class EPAudioRenderer {
     if format == nil || format!.channelCount != buffer.format.channelCount || format!.sampleRate != buffer.format.sampleRate {
       connect(buffer.format)
     }
+    let rms = Self.rms(buffer)
     lock.lock()
     scheduledFrames += AVAudioFramePosition(buffer.frameLength)
+    levels.append((scheduledFrames, rms))
     lock.unlock()
     node.scheduleBuffer(buffer, completionHandler: nil)
   }
@@ -212,12 +242,30 @@ final class EPAudioRenderer {
     if !node.isPlaying { node.play() }
   }
 
+  private static func rms(_ buffer: AVAudioPCMBuffer) -> Float {
+    guard let data = buffer.floatChannelData else { return 1 }
+    let frames = Int(buffer.frameLength)
+    let channels = Int(buffer.format.channelCount)
+    guard frames > 0, channels > 0 else { return 0 }
+    let interleaved = buffer.format.isInterleaved
+    let lanes = interleaved ? 1 : channels
+    let count = interleaved ? frames * channels : frames
+    var sum: Float = 0
+    for lane in 0..<lanes {
+      let samples = data[lane]
+      for i in 0..<count { sum += samples[i] * samples[i] }
+    }
+    return (sum / Float(frames * channels)).squareRoot()
+  }
+
   private func connect(_ newFormat: AVAudioFormat) {
     let engine = graph.engine
     engine.disconnectNodeOutput(node)
     engine.disconnectNodeOutput(timePitch)
+    engine.disconnectNodeOutput(shelf)
     engine.connect(node, to: timePitch, format: newFormat)
-    engine.connect(timePitch, to: graph.bus, fromBus: 0, toBus: graph.bus.nextAvailableInputBus, format: newFormat)
+    engine.connect(timePitch, to: shelf, format: newFormat)
+    engine.connect(shelf, to: graph.bus, fromBus: 0, toBus: graph.bus.nextAvailableInputBus, format: newFormat)
     lock.lock()
     format = newFormat
     lock.unlock()

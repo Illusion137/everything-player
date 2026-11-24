@@ -32,6 +32,7 @@ object EPPlayerEngine : EPPipelineDelegate {
   var downloadedResolver: ((EPTrack) -> Boolean)? = null
   var localSabrResolver: ((EPTrack) -> EPLocalSabrMedia?)? = null
 
+  private const val FADE_FRAME_MS = 16L
   private val main = Handler(Looper.getMainLooper())
   private val sabrPool = EPSabrWarmPool()
   private var sabrTicks = 0
@@ -62,6 +63,8 @@ object EPPlayerEngine : EPPipelineDelegate {
   private var primary: EPPipeline? = null
   private var secondary: EPPipeline? = null
   private var fading = false
+  private var fadeStart: Double? = null
+  private var fadeDuration = 0.0
   private var resumeAfterFocusGain = false
   @Volatile private var snapshot = EPProgress(0.0, 0.0, 0.0)
 
@@ -73,6 +76,14 @@ object EPPlayerEngine : EPPipelineDelegate {
     override fun run() {
       onTick()
       main.postDelayed(this, 100)
+    }
+  }
+
+  private val fadeTick = object : Runnable {
+    override fun run() {
+      if (!fading) return
+      stepFade()
+      main.postDelayed(this, FADE_FRAME_MS)
     }
   }
 
@@ -483,7 +494,7 @@ object EPPlayerEngine : EPPipelineDelegate {
     primary = null
     activePipeline = null
     secondary = null
-    fading = false
+    endFade()
     p?.delegate = null
     s?.delegate = null
     p?.teardown()
@@ -512,7 +523,7 @@ object EPPlayerEngine : EPPipelineDelegate {
     primary = next
     activePipeline = next
     secondary = null
-    fading = false
+    endFade()
     locked {
       activeIndex = newIndex
       pendingSeek = null
@@ -531,12 +542,18 @@ object EPPlayerEngine : EPPipelineDelegate {
 
   private fun cancelFade() {
     if (!fading) return
-    fading = false
+    endFade()
     val s = secondary
     secondary = null
     s?.delegate = null
     s?.teardown()
     primary?.volume = locked { volume }
+  }
+
+  private fun endFade() {
+    fading = false
+    fadeStart = null
+    main.removeCallbacks(fadeTick)
   }
 
   private fun invalidateSecondaryIfStale() {
@@ -685,16 +702,29 @@ object EPPlayerEngine : EPPipelineDelegate {
 
     val s = secondary ?: return
     if (!canFade || getState() != EPState.PLAYING) return
-    if (!fading && remaining <= fadeLength && (s.status == EPPipelineStatus.Ready || s.status == EPPipelineStatus.Playing)) {
-      fading = true
-      s.volume = 0f
-      s.play()
-    }
-    if (!fading) return
-    val progress = (1 - remaining / fadeLength).coerceIn(0.0, 1.0)
-    p.volume = vol * cos(progress * PI / 2).toFloat()
-    s.volume = vol * sin(progress * PI / 2).toFloat()
-    if (remaining <= 0.05) finishFade()
+    if (fading || remaining > fadeLength) return
+    if (s.status != EPPipelineStatus.Ready && s.status != EPPipelineStatus.Playing) return
+    fading = true
+    fadeStart = p.currentTime
+    fadeDuration = maxOf(0.05, minOf(fadeLength, remaining))
+    s.volume = 0f
+    s.play()
+    main.post(fadeTick)
+  }
+
+  private fun stepFade() {
+    val p = primary ?: return
+    val s = secondary ?: return
+    val start = fadeStart ?: return
+    if (!isPlayWhenReady()) return
+    val end = p.track.trimEnd(p.mediaDuration) ?: return
+    val position = p.currentTime
+    val vol = getVolume()
+    val progress = ((position - start) / fadeDuration).coerceIn(0.0, 1.0)
+    val eased = progress * progress * (3 - 2 * progress)
+    p.volume = vol * cos(eased * PI / 2).toFloat()
+    s.volume = vol * sin(eased * PI / 2).toFloat()
+    if (progress >= 1 || end - position <= 0.05) finishFade()
   }
 
   private fun warmUpcomingSabr() {

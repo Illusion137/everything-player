@@ -5,6 +5,13 @@ enum EPLocalMedia {
   case sabr(EPLocalSabrMedia)
 }
 
+private struct EPFadeState {
+  var introStart: Double
+  var start: Double?
+  var duration: Double
+  var quiet: Bool
+}
+
 struct EPActiveTrackChange {
   var lastIndex: Int?
   var lastTrackId: String?
@@ -47,6 +54,9 @@ final class EPPlayerEngine: EPPipelineDelegate {
   private let sabrPool = EPSabrWarmPool()
   private var sabrTicks = 0
   private var fading = false
+  private var fadeState: EPFadeState?
+  private var fadeTimer: DispatchSourceTimer?
+  private var quietSince: Double?
   private var tickTimer: DispatchSourceTimer?
   private var progressTimer: DispatchSourceTimer?
   private var resumeAfterInterruption = false
@@ -62,6 +72,18 @@ final class EPPlayerEngine: EPPipelineDelegate {
     session.onOldDeviceUnavailable = { [weak self] in
       guard let self, self.setupOptions.autoHandleInterruptions else { return }
       self.pause()
+    }
+    session.onWillResignActive = { [weak self] in
+      guard let self, self.locked({ self.playWhenReady }) else { return }
+      self.session.activate()
+    }
+    session.onMediaServicesReset = { [weak self] in
+      guard let self else { return }
+      self.session.configure()
+      guard self.locked({ self.playWhenReady }) else { return }
+      self.session.activate()
+      EPAudioGraph.shared.ensureRunning()
+      self.play()
     }
   }
 
@@ -481,9 +503,9 @@ final class EPPlayerEngine: EPPipelineDelegate {
       let r = (primary, secondary)
       primary = nil
       secondary = nil
-      fading = false
       return r
     }
+    endFade()
     p?.delegate = nil
     s?.delegate = nil
     p?.teardown()
@@ -514,10 +536,11 @@ final class EPPlayerEngine: EPPipelineDelegate {
       pendingSeek = nil
       return o
     }
-    fading = false
+    endFade()
     old?.delegate = nil
     old?.teardown()
     next.volume = locked { volumeValue }
+    next.bassCut = 0
     EPVideoHub.shared.setSource(next.videoSource)
     if locked({ playWhenReady }) { next.play() }
     emitActiveChange(lastIndex: lastIndex, lastTrackId: lastId, lastPosition: lastPosition)
@@ -529,7 +552,7 @@ final class EPPlayerEngine: EPPipelineDelegate {
 
   private func cancelFade() {
     guard fading else { return }
-    fading = false
+    endFade()
     let s = locked { () -> EPPipeline? in
       let s = secondary
       secondary = nil
@@ -538,6 +561,15 @@ final class EPPlayerEngine: EPPipelineDelegate {
     s?.delegate = nil
     s?.teardown()
     primary?.volume = locked { volumeValue }
+    primary?.bassCut = 0
+  }
+
+  private func endFade() {
+    fading = false
+    fadeState = nil
+    quietSince = nil
+    fadeTimer?.cancel()
+    fadeTimer = nil
   }
 
   private func invalidateSecondaryIfStale() {
@@ -701,7 +733,8 @@ final class EPPlayerEngine: EPPipelineDelegate {
     let nextIdx = locked { nextIndex(ignoringRepeatTrack: false) }
     let canFade = fadeLength > 0 && mode != .track && (end - track.trimStart) >= 2 * fadeLength
 
-    if secondary == nil, let nextIdx, mode != .track, remaining <= max(fadeLength, 0) + 8, remaining > 0.25 {
+    let lookahead = canFade ? fadeLength + EPBlend.silenceLookahead : 0
+    if secondary == nil, let nextIdx, mode != .track, remaining <= lookahead + 8, remaining > 0.25 {
       let nextTrack = locked { queue[nextIdx] }
       let pipeline = makePipeline(for: nextTrack)
       pipeline.volume = canFade ? 0 : volume
@@ -709,17 +742,60 @@ final class EPPlayerEngine: EPPipelineDelegate {
       pipeline.load(at: nextTrack.trimStart)
     }
 
-    guard canFade, let secondary, getState() == .playing else { return }
-    if !fading, remaining <= fadeLength, secondary.status == .ready || secondary.status == .playing {
-      fading = true
-      secondary.volume = 0
-      secondary.play()
+    guard canFade, let secondary, getState() == .playing, !fading else { return }
+    let quiet = reachedTrailingSilence(primary, position: position, remaining: remaining, fadeLength: fadeLength)
+    guard remaining <= fadeLength || quiet, secondary.status == .ready || secondary.status == .playing else { return }
+    beginFade(secondary, quiet: quiet)
+  }
+
+  private func reachedTrailingSilence(_ primary: EPPipeline, position: Double, remaining: Double, fadeLength: Double) -> Bool {
+    guard remaining <= fadeLength + EPBlend.silenceLookahead, remaining > EPBlend.minFade,
+          let level = primary.level, level < EPBlend.silenceLevel else {
+      quietSince = nil
+      return false
     }
-    guard fading else { return }
-    let p = Float(min(1, max(0, 1 - remaining / fadeLength)))
-    primary.volume = volume * cos(p * .pi / 2)
-    secondary.volume = volume * sin(p * .pi / 2)
-    if remaining <= 0.05 { finishFade() }
+    let since = quietSince.flatMap { $0 <= position ? $0 : nil } ?? position
+    quietSince = since
+    return position - since >= EPBlend.silenceHold
+  }
+
+  private func beginFade(_ secondary: EPPipeline, quiet: Bool) {
+    fading = true
+    secondary.volume = 0
+    secondary.bassCut = 1
+    secondary.play()
+    fadeState = EPFadeState(introStart: secondary.currentTime, start: nil, duration: 0, quiet: quiet)
+    guard fadeTimer == nil else { return }
+    let timer = DispatchSource.makeTimerSource(queue: .main)
+    timer.schedule(deadline: .now(), repeating: EPBlend.frameInterval)
+    timer.setEventHandler { [weak self] in self?.stepFade() }
+    fadeTimer = timer
+    timer.resume()
+  }
+
+  private func stepFade() {
+    guard fading, let primary, let secondary, var fade = fadeState else { return }
+    guard locked({ playWhenReady }), let end = primary.track.trimEnd(mediaDuration: primary.mediaDuration) else { return }
+    let (volume, fadeLength) = locked { (volumeValue, crossfadeSeconds) }
+    let position = primary.currentTime
+    let remaining = end - position
+    if fade.start == nil {
+      let elapsed = secondary.currentTime - fade.introStart
+      let audible = elapsed >= 0.1 && (secondary.level ?? 1) >= EPBlend.silenceLevel
+      let waited = elapsed >= EPBlend.introWait
+      guard audible || waited || remaining <= EPBlend.minFade else { return }
+      fade.start = position
+      fade.duration = fade.quiet ? min(fadeLength, EPBlend.minFade) : max(0.05, min(fadeLength, remaining))
+      fadeState = fade
+    }
+    let p = min(1, max(0, (position - (fade.start ?? position)) / fade.duration))
+    let t = EPBlend.ease(p)
+    let swap = Float(EPBlend.window(p, from: 0.4, to: 0.6))
+    primary.volume = volume * Float(cos(t * .pi / 2))
+    secondary.volume = volume * Float(sin(t * .pi / 2))
+    primary.bassCut = swap
+    secondary.bassCut = 1 - swap
+    if p >= 1 || remaining <= 0.05 { finishFade() }
   }
 
   private func warmUpcomingSabr() {

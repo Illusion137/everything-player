@@ -11,6 +11,7 @@ final class EPAVPlayerPipeline: NSObject, EPPipeline, EPVideoFrameSource {
   private var item: AVPlayerItem?
   private var loader: EPResourceLoader?
   private var videoOutput: AVPlayerItemVideoOutput?
+  private let blend = EPBlendControl()
   private var observations: [NSKeyValueObservation] = []
   private var notificationTokens: [NSObjectProtocol] = []
   private var pendingSeek: Double?
@@ -71,6 +72,13 @@ final class EPAVPlayerPipeline: NSObject, EPPipeline, EPVideoFrameSource {
       if #available(iOS 16.0, *) { player.defaultRate = newValue }
       if player.rate != 0 { player.rate = newValue }
     }
+  }
+
+  var level: Float? { blend.metered ? blend.level : nil }
+
+  var bassCut: Float {
+    get { blend.bassCut }
+    set { blend.bassCut = min(1, max(0, newValue)) }
   }
 
   var videoSource: EPVideoFrameSource? { videoOutput != nil ? self : nil }
@@ -190,7 +198,7 @@ final class EPAVPlayerPipeline: NSObject, EPPipeline, EPVideoFrameSource {
     if !options.enableVideo {
       for t in item.tracks where t.assetTrack?.mediaType == .video { t.isEnabled = false }
     }
-    if track.sourceType != .hls, let mix = EPEqualizerTap.audioMix(for: item) { item.audioMix = mix }
+    if track.sourceType != .hls, let mix = EPEqualizerTap.audioMix(for: item, blend: blend) { item.audioMix = mix }
   }
 
   private func becameReady() {

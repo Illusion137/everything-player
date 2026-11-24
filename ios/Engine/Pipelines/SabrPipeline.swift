@@ -81,6 +81,13 @@ final class EPSabrPipeline: EPPipeline {
     set { renderer.rate = newValue }
   }
 
+  var level: Float? { renderer.level }
+
+  var bassCut: Float {
+    get { renderer.bassCut }
+    set { renderer.bassCut = newValue }
+  }
+
   var videoSource: EPVideoFrameSource? { frames }
 
   var videoQuality: EPVideoQualityState {
